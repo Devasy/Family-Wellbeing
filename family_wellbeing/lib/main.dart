@@ -2,9 +2,157 @@ import 'dart:math';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:workmanager/workmanager.dart';
+import 'mongo_service.dart';
+
+// ─── In-app debug logger ───────────────────────────────────────────────────
+class AppLogger {
+  AppLogger._();
+  static final AppLogger instance = AppLogger._();
+
+  final List<String> _lines = [];
+
+  void log(String message) {
+    final now = DateTime.now();
+    final ts = '${now.hour.toString().padLeft(2,'0')}:'
+               '${now.minute.toString().padLeft(2,'0')}:'
+               '${now.second.toString().padLeft(2,'0')}';
+    final line = '[$ts] $message';
+    _lines.add(line);
+    debugPrint(line);
+    // Keep last 200 lines
+    if (_lines.length > 200) _lines.removeAt(0);
+  }
+
+  List<String> get lines => List.unmodifiable(_lines);
+
+  String get dump => _lines.join('\n');
+
+  void clear() => _lines.clear();
+}
+
+final _log = AppLogger.instance;
+
+@pragma('vm:entry-point')
+void callbackDispatcher() {
+  Workmanager().executeTask((taskName, inputData) async {
+    try {
+      final success = await runSync();
+      return success;
+    } catch (e) {
+      _log.log('Background Sync Task failed: $e');
+      return false;
+    }
+  });
+}
+
+Future<bool> runSync() async {
+  _log.log('runSync: starting sync process...');
+  final prefs = await SharedPreferences.getInstance();
+  final mongoUri = prefs.getString('mongoUri') ?? '';
+  final memberId = prefs.getString('memberId') ?? '';
+
+  if (mongoUri.isEmpty || memberId.isEmpty) {
+    _log.log('runSync: aborted (missing configuration)');
+    return false;
+  }
+
+  // 1. Check permissions
+  const platform = MethodChannel('com.family.wellbeing/stats');
+  bool perm = false;
+  try {
+    perm = await platform.invokeMethod<bool>('checkPermission') ?? false;
+  } catch (e) {
+    _log.log('runSync: checkPermission error: $e');
+  }
+
+  if (!perm) {
+    _log.log('runSync: aborted (missing permission)');
+    return false;
+  }
+
+  final today = DateTime.now();
+  
+  // Sync last 14 days
+  for (int i = 1; i <= 14; i++) {
+    final pastDay = today.subtract(Duration(days: i));
+    final pastDayStr = '${pastDay.year}-${pastDay.month.toString().padLeft(2, '0')}-${pastDay.day.toString().padLeft(2, '0')}';
+    
+    try {
+      final Map<dynamic, dynamic>? usage = 
+          await platform.invokeMethod<Map<dynamic, dynamic>>('fetchLocalUsage', {'date': pastDayStr});
+      if (usage != null) {
+        final totalMinutes = (usage['totalScreenTimeMinutes'] as num? ?? 0).toInt();
+        if (totalMinutes > 0) {
+          final breakdownRaw = usage['appBreakdown'] as List<dynamic>? ?? [];
+          final breakdown = breakdownRaw.map((app) {
+            return AppUsage(
+              appName: app['appName'] as String? ?? 'Unknown',
+              packageName: app['packageName'] as String? ?? '',
+              minutes: (app['minutes'] as num? ?? 0).toInt(),
+            );
+          }).toList();
+
+          final record = UsageRecord(
+            id: "${memberId}_$pastDayStr",
+            memberId: memberId,
+            date: pastDayStr,
+            totalScreenTimeMinutes: totalMinutes,
+            appBreakdown: breakdown,
+            isComplete: true,
+          );
+
+          await MongoDbService.instance.upsertUsageRecord(mongoUri, record);
+          _log.log('runSync: synced past day $pastDayStr ($totalMinutes min)');
+        }
+      }
+    } catch (e) {
+      _log.log('runSync: error syncing past day $pastDayStr: $e');
+    }
+  }
+
+  // Sync today (isComplete = false)
+  final todayStr = '${today.year}-${today.month.toString().padLeft(2, '0')}-${today.day.toString().padLeft(2, '0')}';
+  try {
+    final Map<dynamic, dynamic>? usage = 
+        await platform.invokeMethod<Map<dynamic, dynamic>>('fetchLocalUsage', {'date': todayStr});
+    if (usage != null) {
+      final totalMinutes = (usage['totalScreenTimeMinutes'] as num? ?? 0).toInt();
+      final breakdownRaw = usage['appBreakdown'] as List<dynamic>? ?? [];
+      final breakdown = breakdownRaw.map((app) {
+        return AppUsage(
+          appName: app['appName'] as String? ?? 'Unknown',
+          packageName: app['packageName'] as String? ?? '',
+          minutes: (app['minutes'] as num? ?? 0).toInt(),
+        );
+      }).toList();
+
+      final record = UsageRecord(
+        id: "${memberId}_$todayStr",
+        memberId: memberId,
+        date: todayStr,
+        totalScreenTimeMinutes: totalMinutes,
+        appBreakdown: breakdown,
+        isComplete: false,
+      );
+
+      await MongoDbService.instance.upsertUsageRecord(mongoUri, record);
+      _log.log('runSync: synced today $todayStr ($totalMinutes min)');
+    }
+  } catch (e) {
+    _log.log('runSync: error syncing today: $e');
+  }
+
+  _log.log('runSync: sync completed successfully');
+  return true;
+}
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
+  Workmanager().initialize(
+    callbackDispatcher,
+    isInDebugMode: false,
+  );
   runApp(const FamilyWellbeingApp());
 }
 
@@ -97,7 +245,7 @@ class _MainLayoutState extends State<MainLayout> with WidgetsBindingObserver {
   String _activeTab = 'dashboard'; // 'dashboard' | 'leaderboard' | 'settings'
 
   // Preferences State
-  String _displayName = 'Arun (You)';
+  String _displayName = 'You';
   String _memberId = '1';
   String _mongoUri = '';
 
@@ -110,11 +258,8 @@ class _MainLayoutState extends State<MainLayout> with WidgetsBindingObserver {
   bool _isSyncing = false;
   DateTime? _lastSynced;
   bool _hasPermission = false;
-  bool _usingMockFallback = true;
-
-  // Mock database (fallback)
-  late List<UsageRecord> _mockDb;
-  late List<Member> _mockMembers;
+  bool _mongoConnected = false;  // true only when real records fetched from Atlas
+  String? _dbError;              // detailed diagnostic error shown in UI
 
   // Platform channel
   static const _platform = MethodChannel('com.family.wellbeing/stats');
@@ -123,9 +268,18 @@ class _MainLayoutState extends State<MainLayout> with WidgetsBindingObserver {
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
-    _initializeMockMembers();
     _loadPreferences().then((_) {
-      _mockDb = _generateMockDatabase();
+      // Schedule background sync via Workmanager
+      Workmanager().registerPeriodicTask(
+        "1",
+        "dailySyncTask",
+        frequency: const Duration(hours: 24),
+        constraints: Constraints(
+          networkType: NetworkType.connected,
+        ),
+      ).catchError((e) {
+        _log.log('Workmanager registration error: $e');
+      });
       _checkStatusAndFetchData();
     });
   }
@@ -143,28 +297,17 @@ class _MainLayoutState extends State<MainLayout> with WidgetsBindingObserver {
     }
   }
 
-  void _initializeMockMembers() {
-    _mockMembers = [
-      Member(id: '1', name: _displayName, deviceModel: 'Pixel 8', avatarColor: const Color(0xFFD85A30)),
-      Member(id: '2', name: 'Priya', deviceModel: 'Samsung S23', avatarColor: const Color(0xFF4A5568)),
-      Member(id: '3', name: 'Rohan', deviceModel: 'OnePlus 11', avatarColor: const Color(0xFF2B6CB0)),
-      Member(id: '4', name: 'Aarav', deviceModel: 'Pixel 7a', avatarColor: const Color(0xFF38A169)),
-      Member(id: '5', name: 'Neha', deviceModel: 'Samsung A54', avatarColor: const Color(0xFFD69E2E)),
-      Member(id: '6', name: 'Vikram', deviceModel: 'Nothing Phone 2', avatarColor: const Color(0xFFE53E3E)),
-    ];
-  }
-
   Future<void> _loadPreferences() async {
     final prefs = await SharedPreferences.getInstance();
     setState(() {
-      _displayName = prefs.getString('displayName') ?? 'Arun (You)';
+      _displayName = prefs.getString('displayName') ?? 'You';
       _memberId = prefs.getString('memberId') ?? '1';
       _mongoUri = prefs.getString('mongoUri') ?? '';
-      _mockMembers[0].name = _displayName;
     });
   }
 
   Future<void> _savePreferences(String name, String id, String uri) async {
+    _log.log('Settings saved: name=$name id=$id uri=${uri.isNotEmpty ? uri.substring(0, uri.length.clamp(0, 30)) + "..." : "(empty)"}');
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString('displayName', name);
     await prefs.setString('memberId', id);
@@ -174,22 +317,35 @@ class _MainLayoutState extends State<MainLayout> with WidgetsBindingObserver {
       _displayName = name;
       _memberId = id;
       _mongoUri = uri;
-      _mockMembers[0].name = _displayName;
     });
 
-    try {
-      await _platform.invokeMethod('saveConfig', {
-        'mongoUri': uri,
-        'memberId': id,
-      });
-    } on PlatformException catch (e) {
-      debugPrint("Failed to save config to native: ${e.message}");
-    }
+    // Run a full connection diagnostic immediately after saving
+    await _testMongoConnection();
+    await _checkStatusAndFetchData();
+  }
 
-    _checkStatusAndFetchData();
+  Future<void> _testMongoConnection() async {
+    if (_mongoUri.isEmpty) return;
+    _log.log('testConnection: starting...');
+    setState(() => _dbError = null);
+    try {
+      final String report = await MongoDbService.instance.testConnection(_mongoUri);
+      final parts = report.split('|');
+      final status = parts[0];
+      final detail = parts.length > 1 ? parts[1] : report;
+      _log.log('testConnection result: $status');
+      _log.log(detail);
+      if (status != 'OK') {
+        setState(() => _dbError = detail);
+      }
+    } catch (e) {
+      _log.log('testConnection exception: $e');
+      setState(() => _dbError = e.toString());
+    }
   }
 
   Future<void> _checkStatusAndFetchData() async {
+    _log.log('checkStatus: starting (mongoUri=${_mongoUri.isNotEmpty ? "set" : "empty"})');
     setState(() => _isSyncing = true);
     
     // Check permission
@@ -203,6 +359,7 @@ class _MainLayoutState extends State<MainLayout> with WidgetsBindingObserver {
     setState(() {
       _hasPermission = perm;
     });
+    _log.log('checkPermission: $perm');
 
     // Fetch local usage
     if (perm) {
@@ -230,74 +387,34 @@ class _MainLayoutState extends State<MainLayout> with WidgetsBindingObserver {
     }
 
     // Fetch MongoDB stats
-    bool dbFetchSuccess = false;
     if (_mongoUri.isNotEmpty) {
+      _log.log('fetchDbData: calling Dart mongo_dart...');
       try {
-        final List<dynamic>? recordsRaw = await _platform.invokeMethod<List<dynamic>>('fetchDbData');
-        if (recordsRaw != null && recordsRaw.isNotEmpty) {
-          final List<UsageRecord> records = recordsRaw.map((recordMap) {
-            final map = Map<String, dynamic>.from(recordMap as Map);
-            final appBreakdownRaw = map['appBreakdown'] as List<dynamic>? ?? [];
-            final appBreakdown = appBreakdownRaw.map((app) {
-              final appMap = Map<String, dynamic>.from(app as Map);
-              return AppUsage(
-                appName: appMap['appName'] as String? ?? 'Unknown',
-                packageName: appMap['packageName'] as String? ?? '',
-                minutes: (appMap['minutes'] as num? ?? 0).toInt(),
-              );
-            }).toList();
-
-            return UsageRecord(
-              id: map['id'] as String? ?? '',
-              memberId: map['memberId'] as String? ?? '',
-              date: map['date'] as String? ?? '',
-              totalScreenTimeMinutes: (map['totalScreenTimeMinutes'] as num? ?? 0).toInt(),
-              appBreakdown: appBreakdown,
-              isComplete: map['isComplete'] as bool? ?? false,
-            );
-          }).toList();
-
-          setState(() {
-            _dbRecords = records;
-            _usingMockFallback = false;
-          });
-          dbFetchSuccess = true;
-        }
-      } on PlatformException catch (e) {
-        debugPrint("Failed to fetch MongoDB stats: ${e.message}");
+        final List<UsageRecord> records = await MongoDbService.instance.fetchAllUsageRecords(_mongoUri);
+        _log.log('fetchDbData: got ${records.length} records');
+        setState(() {
+          _dbRecords = records;
+          _mongoConnected = true;
+          _dbError = null;
+        });
+      } catch (e) {
+        _log.log('fetchDbData exception: $e');
+        setState(() {
+          _mongoConnected = false;
+          _dbError = e.toString();
+        });
       }
-    }
-
-    if (!dbFetchSuccess) {
+    } else {
+      _log.log('fetchDbData: skipped (no URI)');
       setState(() {
-        _usingMockFallback = true;
+        _mongoConnected = false;
+        _dbError = null;
       });
-      if (perm) {
-        _updateMockDataWithLive();
-      }
     }
 
     setState(() {
       _lastSynced = DateTime.now();
       _isSyncing = false;
-    });
-  }
-
-  void _updateMockDataWithLive() {
-    setState(() {
-      final todayIndex = _mockDb.indexWhere(
-        (r) => r.memberId == '1' && r.date == '2026-07-01'
-      );
-      if (todayIndex != -1) {
-        _mockDb[todayIndex] = UsageRecord(
-          id: '1_2026-07-01',
-          memberId: '1',
-          date: '2026-07-01',
-          totalScreenTimeMinutes: _localTodayTotalMinutes,
-          appBreakdown: _localTodayBreakdown,
-          isComplete: false,
-        );
-      }
     });
   }
 
@@ -312,68 +429,17 @@ class _MainLayoutState extends State<MainLayout> with WidgetsBindingObserver {
   Future<void> _triggerManualSync() async {
     setState(() => _isSyncing = true);
     try {
-      await _platform.invokeMethod('triggerSync');
-    } on PlatformException catch (e) {
-      debugPrint("Failed to trigger sync: ${e.message}");
+      await runSync();
+    } catch (e) {
+      _log.log('Failed to trigger manual sync: $e');
     }
-    await Future.delayed(const Duration(seconds: 2));
     await _checkStatusAndFetchData();
   }
 
-  List<UsageRecord> _generateMockDatabase() {
-    final db = <UsageRecord>[];
-    final apps = ["Instagram", "WhatsApp", "YouTube", "Chrome", "Notion", "Spotify", "Maps"];
-    final dates = [
-      '2026-06-25', '2026-06-26', '2026-06-27', '2026-06-28', 
-      '2026-06-29', '2026-06-30', '2026-07-01'
-    ];
 
-    final rand = Random(42);
 
-    for (final member in _mockMembers) {
-      for (final date in dates) {
-        final isToday = date == '2026-07-01';
-        
-        int totalMins = isToday 
-            ? rand.nextInt(120) + 20 
-            : rand.nextInt(240) + 60;
-            
-        int remaining = totalMins;
-        final breakdown = <AppUsage>[];
-        final shuffledApps = List<String>.from(apps)..shuffle(rand);
-        final userApps = shuffledApps.sublist(0, 3);
-        
-        for (int i = 0; i < userApps.length; i++) {
-          final appName = userApps[i];
-          if (i == userApps.length - 1) {
-            breakdown.add(AppUsage(appName: appName, packageName: 'com.$appName', minutes: remaining));
-          } else {
-            final mins = remaining > 0 ? rand.nextInt((remaining * 0.7).toInt() + 1) : 0;
-            breakdown.add(AppUsage(appName: appName, packageName: 'com.$appName', minutes: mins));
-            remaining -= mins;
-          }
-        }
-        
-        breakdown.sort((a, b) => b.minutes.compareTo(a.minutes));
-
-        db.add(UsageRecord(
-          id: '${member.id}_$date',
-          memberId: member.id,
-          date: date,
-          totalScreenTimeMinutes: totalMins,
-          appBreakdown: breakdown,
-          isComplete: !isToday,
-        ));
-      }
-    }
-    return db;
-  }
 
   List<Member> _getMembersList(List<UsageRecord> db) {
-    if (_usingMockFallback) {
-      return _mockMembers;
-    }
-
     // Dynamically resolve unique member records from synced MongoDB Atlas docs
     final uniqueIds = db.map((r) => r.memberId).toSet();
     uniqueIds.add(_memberId); // Ensure current user is present
@@ -395,15 +461,14 @@ class _MainLayoutState extends State<MainLayout> with WidgetsBindingObserver {
         dynamicMembers.add(Member(
           id: id,
           name: _displayName,
-          deviceModel: 'Pixel 8 (This Device)',
+          deviceModel: 'This Device',
           avatarColor: const Color(0xFFD85A30),
         ));
       } else {
-        // Generate consistent avatar color based on hash of member ID
         final colorIndex = id.hashCode.abs() % avatarColors.length;
         dynamicMembers.add(Member(
           id: id,
-          name: id, // display ID as name
+          name: 'Member $id',
           deviceModel: 'Family Member',
           avatarColor: avatarColors[colorIndex],
         ));
@@ -421,7 +486,7 @@ class _MainLayoutState extends State<MainLayout> with WidgetsBindingObserver {
 
   @override
   Widget build(BuildContext context) {
-    final List<UsageRecord> currentDb = _usingMockFallback ? _mockDb : _dbRecords;
+    final List<UsageRecord> currentDb = _dbRecords;
 
     return Scaffold(
       appBar: PreferredSize(
@@ -527,8 +592,12 @@ class _MainLayoutState extends State<MainLayout> with WidgetsBindingObserver {
           members: _getMembersList(currentDb),
           myId: _memberId,
           hasPermission: _hasPermission,
-          usingMockFallback: _usingMockFallback,
+          mongoConnected: _mongoConnected,
+          mongoUri: _mongoUri,
+          dbError: _dbError,
+          isSyncing: _isSyncing,
           formatDuration: _formatDuration,
+          onGoToSettings: () => setState(() => _activeTab = 'settings'),
         );
       case 'settings':
         return SettingsView(
@@ -537,6 +606,8 @@ class _MainLayoutState extends State<MainLayout> with WidgetsBindingObserver {
           mongoUri: _mongoUri,
           hasPermission: _hasPermission,
           isSyncing: _isSyncing,
+          dbError: _dbError,
+          logLines: AppLogger.instance.lines,
           onRequestPermission: _requestUsagePermission,
           onSaveConfig: _savePreferences,
           onManualSync: _triggerManualSync,
@@ -796,18 +867,32 @@ class _MainLayoutState extends State<MainLayout> with WidgetsBindingObserver {
                   color: Color(0xFF71717A),
                 ),
               ),
-              if (_usingMockFallback) ...[
+              if (!_mongoConnected) ...[
                 const SizedBox(width: 6),
                 Container(
                   padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 0.5),
                   decoration: BoxDecoration(
-                    color: const Color(0xFFFEF3C7),
+                    color: const Color(0xFFFEE2E2),
                     borderRadius: BorderRadius.circular(3),
-                    border: Border.all(color: const Color(0xFFFDE68A)),
+                    border: Border.all(color: const Color(0xFFFCA5A5)),
                   ),
                   child: const Text(
-                    'DEMO',
-                    style: TextStyle(fontSize: 8, color: Color(0xFFB45309), fontWeight: FontWeight.bold),
+                    'OFFLINE',
+                    style: TextStyle(fontSize: 8, color: Color(0xFFDC2626), fontWeight: FontWeight.bold),
+                  ),
+                )
+              ] else ...[
+                const SizedBox(width: 6),
+                Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 0.5),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFFD1FAE5),
+                    borderRadius: BorderRadius.circular(3),
+                    border: Border.all(color: const Color(0xFFA7F3D0)),
+                  ),
+                  child: const Text(
+                    'ATLAS',
+                    style: TextStyle(fontSize: 8, color: Color(0xFF065F46), fontWeight: FontWeight.bold),
                   ),
                 )
               ]
@@ -901,8 +986,12 @@ class LeaderboardView extends StatefulWidget {
   final List<Member> members;
   final String myId;
   final bool hasPermission;
-  final bool usingMockFallback;
+  final bool mongoConnected;
+  final String mongoUri;
+  final String? dbError;
+  final bool isSyncing;
   final String Function(int) formatDuration;
+  final VoidCallback onGoToSettings;
 
   const LeaderboardView({
     super.key,
@@ -910,8 +999,12 @@ class LeaderboardView extends StatefulWidget {
     required this.members,
     required this.myId,
     required this.hasPermission,
-    required this.usingMockFallback,
+    required this.mongoConnected,
+    required this.mongoUri,
+    required this.dbError,
+    required this.isSyncing,
     required this.formatDuration,
+    required this.onGoToSettings,
   });
 
   @override
@@ -924,6 +1017,18 @@ class _LeaderboardViewState extends State<LeaderboardView> {
 
   @override
   Widget build(BuildContext context) {
+    // --- Guard: not connected ---
+    if (!widget.mongoConnected) {
+      return _buildNotConnectedState(context);
+    }
+
+    final today = DateTime.now();
+    final todayStr = '${today.year}-${today.month.toString().padLeft(2,'0')}-${today.day.toString().padLeft(2,'0')}';
+    final weekDates = List.generate(7, (i) {
+      final d = today.subtract(Duration(days: i));
+      return '${d.year}-${d.month.toString().padLeft(2,'0')}-${d.day.toString().padLeft(2,'0')}';
+    });
+
     // Process records
     final List<Map<String, dynamic>> rankedData = widget.members.map((member) {
       int totalMinutes = 0;
@@ -935,20 +1040,19 @@ class _LeaderboardViewState extends State<LeaderboardView> {
       } else {
         if (_timeframe == 'today') {
           final record = widget.db.firstWhere(
-            (r) => r.memberId == member.id && r.date == '2026-07-01',
-            orElse: () => UsageRecord(id: '', memberId: member.id, date: '2026-07-01', totalScreenTimeMinutes: 0, appBreakdown: [], isComplete: false),
+            (r) => r.memberId == member.id && r.date == todayStr,
+            orElse: () => UsageRecord(id: '', memberId: member.id, date: todayStr, totalScreenTimeMinutes: 0, appBreakdown: [], isComplete: false),
           );
           totalMinutes = record.totalScreenTimeMinutes;
           for (var app in record.appBreakdown) {
             combinedBreakdown[app.appName] = (combinedBreakdown[app.appName] ?? 0) + app.minutes;
           }
         } else {
-          final dates = ['2026-06-25', '2026-06-26', '2026-06-27', '2026-06-28', '2026-06-29', '2026-06-30', '2026-07-01'];
-          for (final date in dates) {
+          for (final date in weekDates) {
             final record = widget.db.firstWhere(
               (r) => r.memberId == member.id && r.date == date,
               orElse: () => UsageRecord(id: '', memberId: member.id, date: date, totalScreenTimeMinutes: 0, appBreakdown: [], isComplete: false),
-          );
+            );
             totalMinutes += record.totalScreenTimeMinutes;
             for (var app in record.appBreakdown) {
               combinedBreakdown[app.appName] = (combinedBreakdown[app.appName] ?? 0) + app.minutes;
@@ -977,6 +1081,11 @@ class _LeaderboardViewState extends State<LeaderboardView> {
       return (a['minutes'] as int).compareTo(b['minutes'] as int);
     });
 
+    // If connected but no records at all yet
+    if (rankedData.every((d) => (d['minutes'] as int) == 0 && !(d['missingPermission'] as bool))) {
+      return _buildEmptyAtlasState();
+    }
+
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -998,27 +1107,25 @@ class _LeaderboardViewState extends State<LeaderboardView> {
                 Container(
                   padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
                   decoration: BoxDecoration(
-                    color: widget.usingMockFallback ? const Color(0xFFFEF3C7) : const Color(0xFFD1FAE5),
+                    color: const Color(0xFFD1FAE5),
                     borderRadius: BorderRadius.circular(6),
-                    border: Border.all(color: widget.usingMockFallback ? const Color(0xFFFDE68A) : const Color(0xFFA7F3D0)),
+                    border: Border.all(color: const Color(0xFFA7F3D0)),
                   ),
-                  child: Text(
-                    widget.usingMockFallback ? 'DEMO DATA' : 'ATLAS SYNCED',
+                  child: const Text(
+                    'ATLAS SYNCED',
                     style: TextStyle(
                       fontSize: 9,
                       fontWeight: FontWeight.bold,
-                      color: widget.usingMockFallback ? const Color(0xFFB45309) : const Color(0xFF065F46),
+                      color: Color(0xFF065F46),
                     ),
                   ),
                 ),
               ],
             ),
             const SizedBox(height: 4),
-            Text(
-              widget.usingMockFallback 
-                  ? 'Showing simulated family screen time.' 
-                  : 'Real live family stats synced from Atlas.',
-              style: const TextStyle(
+            const Text(
+              'Real live family stats synced from Atlas.',
+              style: TextStyle(
                 fontSize: 14,
                 color: Color(0xFF71717A),
               ),
@@ -1305,6 +1412,191 @@ class _LeaderboardViewState extends State<LeaderboardView> {
     );
   }
 
+  Widget _buildNotConnectedState(BuildContext context) {
+    final bool noUri = widget.mongoUri.isEmpty;
+    final String headline = noUri
+        ? 'No Database Configured'
+        : (widget.isSyncing ? 'Connecting to MongoDB...' : 'MongoDB Connection Failed');
+    final String subtitle = noUri
+        ? 'Enter your MongoDB Atlas connection string in Settings to sync family data.'
+        : 'Could not reach your Atlas cluster. See the error below.';
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        const Text(
+          'Leaderboard',
+          style: TextStyle(
+            fontSize: 26,
+            color: Color(0xFF18181B),
+            fontWeight: FontWeight.bold,
+            letterSpacing: -0.5,
+          ),
+        ),
+        const SizedBox(height: 24),
+        Card(
+          child: Padding(
+            padding: const EdgeInsets.all(24.0),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Icon(
+                  noUri ? Icons.cloud_off_outlined : Icons.warning_amber_rounded,
+                  color: noUri ? const Color(0xFF71717A) : const Color(0xFFDC2626),
+                  size: 32,
+                ),
+                const SizedBox(height: 16),
+                Text(
+                  headline,
+                  style: const TextStyle(
+                    fontSize: 17,
+                    fontWeight: FontWeight.bold,
+                    color: Color(0xFF18181B),
+                  ),
+                ),
+                const SizedBox(height: 8),
+                Text(
+                  subtitle,
+                  style: const TextStyle(
+                    fontSize: 14,
+                    color: Color(0xFF71717A),
+                    height: 1.5,
+                  ),
+                ),
+                if (widget.dbError != null && widget.dbError!.isNotEmpty) ...[
+                  const SizedBox(height: 16),
+                  Container(
+                    width: double.infinity,
+                    padding: const EdgeInsets.all(12),
+                    decoration: BoxDecoration(
+                      color: const Color(0xFFFEF2F2),
+                      borderRadius: BorderRadius.circular(8),
+                      border: Border.all(color: const Color(0xFFFEE2E2)),
+                    ),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        const Text(
+                          'DIAGNOSTIC REPORT',
+                          style: TextStyle(
+                            fontSize: 9,
+                            fontWeight: FontWeight.bold,
+                            color: Color(0xFFDC2626),
+                            letterSpacing: 1.0,
+                          ),
+                        ),
+                        const SizedBox(height: 8),
+                        Text(
+                          widget.dbError!,
+                          style: const TextStyle(
+                            fontSize: 11,
+                            fontFamily: 'monospace',
+                            color: Color(0xFF7F1D1D),
+                            height: 1.6,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ],
+                const SizedBox(height: 20),
+                GestureDetector(
+                  onTap: widget.onGoToSettings,
+                  child: Container(
+                    width: double.infinity,
+                    padding: const EdgeInsets.symmetric(vertical: 14),
+                    decoration: BoxDecoration(
+                      color: const Color(0xFF18181B),
+                      borderRadius: BorderRadius.circular(10),
+                    ),
+                    child: const Center(
+                      child: Text(
+                        'Open Settings',
+                        style: TextStyle(
+                          color: Colors.white,
+                          fontWeight: FontWeight.bold,
+                          fontSize: 14,
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildEmptyAtlasState() {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Row(
+          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+          children: [
+            const Text(
+              'Leaderboard',
+              style: TextStyle(
+                fontSize: 26,
+                color: Color(0xFF18181B),
+                fontWeight: FontWeight.bold,
+                letterSpacing: -0.5,
+              ),
+            ),
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+              decoration: BoxDecoration(
+                color: const Color(0xFFD1FAE5),
+                borderRadius: BorderRadius.circular(6),
+                border: Border.all(color: const Color(0xFFA7F3D0)),
+              ),
+              child: const Text(
+                'ATLAS CONNECTED',
+                style: TextStyle(
+                  fontSize: 9,
+                  fontWeight: FontWeight.bold,
+                  color: Color(0xFF065F46),
+                ),
+              ),
+            ),
+          ],
+        ),
+        const SizedBox(height: 24),
+        Card(
+          child: Padding(
+            padding: const EdgeInsets.all(24.0),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: const [
+                Icon(Icons.hourglass_empty_rounded, color: Color(0xFF71717A), size: 32),
+                SizedBox(height: 16),
+                Text(
+                  'No data synced yet',
+                  style: TextStyle(
+                    fontSize: 17,
+                    fontWeight: FontWeight.bold,
+                    color: Color(0xFF18181B),
+                  ),
+                ),
+                SizedBox(height: 8),
+                Text(
+                  'Connected to Atlas successfully. Waiting for data.\n\nThe background sync runs once a day. Trigger a manual sync from Settings, or wait for the first automatic nightly sync.',
+                  style: TextStyle(
+                    fontSize: 14,
+                    color: Color(0xFF71717A),
+                    height: 1.5,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
   Widget _buildSegmentTab(String title, String tab) {
     final bool isActive = _timeframe == tab;
     return GestureDetector(
@@ -1339,6 +1631,8 @@ class SettingsView extends StatefulWidget {
   final String mongoUri;
   final bool hasPermission;
   final bool isSyncing;
+  final String? dbError;
+  final List<String> logLines;
   final VoidCallback onRequestPermission;
   final Function(String, String, String) onSaveConfig;
   final VoidCallback onManualSync;
@@ -1351,6 +1645,8 @@ class SettingsView extends StatefulWidget {
     required this.mongoUri,
     required this.hasPermission,
     required this.isSyncing,
+    required this.dbError,
+    required this.logLines,
     required this.onRequestPermission,
     required this.onSaveConfig,
     required this.onManualSync,
@@ -1486,6 +1782,30 @@ class _SettingsViewState extends State<SettingsView> {
                     ),
                   ],
                 ),
+                if (widget.dbError != null) ...[
+                  const SizedBox(height: 12),
+                  Container(
+                    padding: const EdgeInsets.all(12),
+                    decoration: BoxDecoration(
+                      color: const Color(0xFFFEE2E2),
+                      borderRadius: BorderRadius.circular(8),
+                      border: Border.all(color: const Color(0xFFFCA5A5)),
+                    ),
+                    child: Row(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        const Icon(Icons.error_outline, color: Color(0xFFDC2626), size: 16),
+                        const SizedBox(width: 8),
+                        Expanded(
+                          child: Text(
+                            'Connection Error: ${widget.dbError}',
+                            style: const TextStyle(fontSize: 11, color: Color(0xFF991B1B)),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ],
               ],
             ),
           ),
@@ -1614,6 +1934,113 @@ class _SettingsViewState extends State<SettingsView> {
               ),
             ]
           ],
+        ),
+        const SizedBox(height: 24),
+
+        // ─── Debug Logs ────────────────────────────────────────────────
+        _buildSectionHeader('DEBUG LOGS'),
+        const SizedBox(height: 8),
+        Card(
+          child: Padding(
+            padding: const EdgeInsets.all(16),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  children: [
+                    Text(
+                      '${widget.logLines.length} entries',
+                      style: const TextStyle(fontSize: 12, color: Color(0xFF71717A)),
+                    ),
+                    Row(
+                      children: [
+                        GestureDetector(
+                          onTap: () {
+                            AppLogger.instance.clear();
+                            ScaffoldMessenger.of(context).showSnackBar(
+                              const SnackBar(content: Text('Logs cleared'), duration: Duration(seconds: 1)),
+                            );
+                            setState(() {});
+                          },
+                          child: const Padding(
+                            padding: EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                            child: Text('Clear', style: TextStyle(fontSize: 12, color: Color(0xFF71717A))),
+                          ),
+                        ),
+                        GestureDetector(
+                          onTap: () {
+                            Clipboard.setData(ClipboardData(text: AppLogger.instance.dump));
+                            ScaffoldMessenger.of(context).showSnackBar(
+                              const SnackBar(
+                                content: Text('Logs copied to clipboard!'),
+                                behavior: SnackBarBehavior.floating,
+                                duration: Duration(seconds: 2),
+                              ),
+                            );
+                          },
+                          child: Container(
+                            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                            decoration: BoxDecoration(
+                              color: const Color(0xFF18181B),
+                              borderRadius: BorderRadius.circular(6),
+                            ),
+                            child: const Text(
+                              'Copy All',
+                              style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: Colors.white),
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 10),
+                Container(
+                  width: double.infinity,
+                  height: 200,
+                  padding: const EdgeInsets.all(10),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFF0F172A),
+                    borderRadius: BorderRadius.circular(8),
+                  ),
+                  child: widget.logLines.isEmpty
+                      ? const Center(
+                          child: Text(
+                            'No logs yet. Save settings or trigger a sync.',
+                            style: TextStyle(fontSize: 11, color: Color(0xFF64748B), fontStyle: FontStyle.italic),
+                            textAlign: TextAlign.center,
+                          ),
+                        )
+                      : ListView.builder(
+                          reverse: true,
+                          itemCount: widget.logLines.length,
+                          itemBuilder: (ctx, i) {
+                            final line = widget.logLines[widget.logLines.length - 1 - i];
+                            final isError = line.contains('Exception') || line.contains('error') || line.contains('Error') || line.contains('FAILED');
+                            final isOk = line.contains('SUCCESS') || line.contains('OK') || line.contains('got ') || line.contains('sent');
+                            return Padding(
+                              padding: const EdgeInsets.only(bottom: 2),
+                              child: Text(
+                                line,
+                                style: TextStyle(
+                                  fontSize: 10,
+                                  fontFamily: 'monospace',
+                                  color: isError
+                                      ? const Color(0xFFFCA5A5)
+                                      : isOk
+                                          ? const Color(0xFF86EFAC)
+                                          : const Color(0xFF94A3B8),
+                                  height: 1.4,
+                                ),
+                              ),
+                            );
+                          },
+                        ),
+                ),
+              ],
+            ),
+          ),
         ),
         const SizedBox(height: 24),
       ],
