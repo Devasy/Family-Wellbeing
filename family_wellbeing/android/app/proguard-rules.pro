@@ -1,0 +1,14 @@
+-keep class com.mongodb.** { *; }
+-keep class org.bson.** { *; }
+-dontwarn com.mongodb.**
+-dontwarn org.bson.**
+-dontwarn io.netty.**
+-dontwarn reactor.**
+-dontwarn javax.naming.**
+-dontwarn javax.security.**
+-dontwarn org.ietf.jgss.**
+-dontwarn org.slf4j.**
+-dontwarn org.xerial.snappy.**
+-dontwarn software.amazon.awssdk.**
+-dontwarn io.micrometer.**
+-dontwarn jnr.posix.**
