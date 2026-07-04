@@ -5,23 +5,40 @@ class MongoDbService {
   MongoDbService._();
   static final MongoDbService instance = MongoDbService._();
 
+  /// Forces the database name to 'wellbeing' if not explicitly defined in the URI path
+  String _getFormattedUri(String uri) {
+    if (uri.isEmpty) return uri;
+    try {
+      final parsed = Uri.parse(uri);
+      // If path is empty, "/", or just query params, replace with "/wellbeing"
+      if (parsed.path.isEmpty || parsed.path == '/') {
+        return parsed.replace(path: '/wellbeing').toString();
+      }
+      return uri;
+    } catch (_) {
+      return uri;
+    }
+  }
+
   /// Test connection and return a diagnostic report
-  Future<String> testConnection(String uri) async {
+  Future<String> testConnection(String rawUri) async {
+    final uri = _getFormattedUri(rawUri);
     final steps = <String>[];
     steps.add("[1] URI type: ${uri.startsWith('mongodb+srv://') ? 'mongodb+srv://' : 'standard mongodb://'}");
-    steps.add("[2] Initializing mongo_dart client...");
+    steps.add("[2] Target database: wellbeing");
+    steps.add("[3] Initializing mongo_dart client...");
 
     Db? db;
     try {
       db = await Db.create(uri);
-      steps.add("[3] Awaiting connection open (TLS enabled natively)...");
+      steps.add("[4] Awaiting connection open (TLS enabled natively)...");
       await db.open();
       
-      steps.add("[4] Connection successfully established!");
+      steps.add("[5] Connection successfully established!");
       
       final collection = db.collection('daily_usage');
       final count = await collection.count();
-      steps.add("[5] Collection 'wellbeing.daily_usage': $count document(s) found.");
+      steps.add("[6] Collection 'wellbeing.daily_usage': $count document(s) found.");
       
       return "OK|${steps.join('\n')}";
     } catch (e) {
@@ -37,7 +54,8 @@ class MongoDbService {
   }
 
   /// Fetch all usage records
-  Future<List<UsageRecord>> fetchAllUsageRecords(String uri) async {
+  Future<List<UsageRecord>> fetchAllUsageRecords(String rawUri) async {
+    final uri = _getFormattedUri(rawUri);
     if (uri.isEmpty) return [];
     
     Db? db;
@@ -80,7 +98,8 @@ class MongoDbService {
   }
 
   /// Upsert a single usage record
-  Future<bool> upsertUsageRecord(String uri, UsageRecord record) async {
+  Future<bool> upsertUsageRecord(String rawUri, UsageRecord record) async {
+    final uri = _getFormattedUri(rawUri);
     if (uri.isEmpty) return false;
     
     Db? db;

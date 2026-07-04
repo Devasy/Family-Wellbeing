@@ -4,6 +4,7 @@ import 'package:flutter/services.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:workmanager/workmanager.dart';
 import 'mongo_service.dart';
+import 'usage_ring_chart.dart';
 
 // ─── In-app debug logger ───────────────────────────────────────────────────
 class AppLogger {
@@ -50,7 +51,27 @@ Future<bool> runSync() async {
   _log.log('runSync: starting sync process...');
   final prefs = await SharedPreferences.getInstance();
   final mongoUri = prefs.getString('mongoUri') ?? '';
-  final memberId = prefs.getString('memberId') ?? '';
+  var memberId = prefs.getString('memberId') ?? '';
+
+  const platform = MethodChannel('com.family.wellbeing/stats');
+
+  if (memberId.isEmpty || memberId == '1') {
+    try {
+      final Map<dynamic, dynamic>? metadata = 
+          await platform.invokeMethod<Map<dynamic, dynamic>>('getDeviceMetadata');
+      if (metadata != null) {
+        memberId = metadata['deviceId'] as String? ?? 'unknown';
+        await prefs.setString('memberId', memberId);
+        final String deviceName = metadata['deviceName'] as String? ?? 'Device';
+        final String currentName = prefs.getString('displayName') ?? '';
+        if (currentName.isEmpty || currentName == 'You') {
+          await prefs.setString('displayName', deviceName);
+        }
+      }
+    } catch (e) {
+      _log.log('runSync: error fetching device metadata: $e');
+    }
+  }
 
   if (mongoUri.isEmpty || memberId.isEmpty) {
     _log.log('runSync: aborted (missing configuration)');
@@ -58,7 +79,6 @@ Future<bool> runSync() async {
   }
 
   // 1. Check permissions
-  const platform = MethodChannel('com.family.wellbeing/stats');
   bool perm = false;
   try {
     perm = await platform.invokeMethod<bool>('checkPermission') ?? false;
@@ -178,7 +198,7 @@ class FamilyWellbeingApp extends StatelessWidget {
           color: const Color(0xFFFAFAFA),
           elevation: 0,
           shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(16),
+            borderRadius: BorderRadius.circular(20),
             side: const BorderSide(color: Color(0xFFE4E4E7), width: 1),
           ),
         ),
@@ -299,15 +319,41 @@ class _MainLayoutState extends State<MainLayout> with WidgetsBindingObserver {
 
   Future<void> _loadPreferences() async {
     final prefs = await SharedPreferences.getInstance();
+    var name = prefs.getString('displayName') ?? 'You';
+    var id = prefs.getString('memberId') ?? '1';
+    final uri = prefs.getString('mongoUri') ?? '';
+
+    if (id == '1' || name == 'You') {
+      try {
+        const platform = MethodChannel('com.family.wellbeing/stats');
+        final Map<dynamic, dynamic>? metadata = 
+            await platform.invokeMethod<Map<dynamic, dynamic>>('getDeviceMetadata');
+        if (metadata != null) {
+          final String deviceName = metadata['deviceName'] as String? ?? 'Device';
+          final String deviceId = metadata['deviceId'] as String? ?? 'unknown';
+          if (name == 'You') {
+            name = deviceName;
+            await prefs.setString('displayName', deviceName);
+          }
+          if (id == '1') {
+            id = deviceId;
+            await prefs.setString('memberId', deviceId);
+          }
+        }
+      } catch (e) {
+        _log.log('Error fetching device metadata: $e');
+      }
+    }
+
     setState(() {
-      _displayName = prefs.getString('displayName') ?? 'You';
-      _memberId = prefs.getString('memberId') ?? '1';
-      _mongoUri = prefs.getString('mongoUri') ?? '';
+      _displayName = name;
+      _memberId = id;
+      _mongoUri = uri;
     });
   }
 
   Future<void> _savePreferences(String name, String id, String uri) async {
-    _log.log('Settings saved: name=$name id=$id uri=${uri.isNotEmpty ? uri.substring(0, uri.length.clamp(0, 30)) + "..." : "(empty)"}');
+    _log.log('Settings saved: name=$name id=$id uri=${uri.isNotEmpty ? "${uri.substring(0, uri.length.clamp(0, 30))}..." : "(empty)"}');
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString('displayName', name);
     await prefs.setString('memberId', id);
@@ -650,37 +696,6 @@ class _MainLayoutState extends State<MainLayout> with WidgetsBindingObserver {
         ),
         const SizedBox(height: 24),
         
-        Card(
-          child: Container(
-            width: double.infinity,
-            padding: const EdgeInsets.symmetric(vertical: 48),
-            child: Column(
-              children: [
-                const Text(
-                  'TODAY (LIVE)',
-                  style: TextStyle(
-                    fontSize: 10,
-                    fontWeight: FontWeight.bold,
-                    color: Color(0xFF71717A),
-                    letterSpacing: 1.5,
-                  ),
-                ),
-                const SizedBox(height: 8),
-                Text(
-                  _formatDuration(_localTodayTotalMinutes),
-                  style: const TextStyle(
-                    fontSize: 58,
-                    fontWeight: FontWeight.bold,
-                    color: Color(0xFF18181B),
-                    letterSpacing: -1.5,
-                  ),
-                ),
-              ],
-            ),
-          ),
-        ),
-        const SizedBox(height: 28),
-        
         const Text(
           'App Breakdown',
           style: TextStyle(
@@ -691,60 +706,35 @@ class _MainLayoutState extends State<MainLayout> with WidgetsBindingObserver {
         ),
         const SizedBox(height: 12),
         Card(
-          child: ClipRRect(
-            borderRadius: BorderRadius.circular(16),
-            child: ListView.separated(
-              shrinkWrap: true,
-              physics: const NeverScrollableScrollPhysics(),
-              itemCount: _localTodayBreakdown.isEmpty ? 1 : _localTodayBreakdown.length,
-              separatorBuilder: (context, index) => Container(
-                height: 1,
-                color: const Color(0xFFE5E7EB),
-              ),
-              itemBuilder: (context, index) {
-                if (_localTodayBreakdown.isEmpty) {
-                  return const Padding(
-                    padding: EdgeInsets.symmetric(vertical: 32.0, horizontal: 20.0),
-                    child: Center(
-                      child: Text(
+          child: Padding(
+            padding: const EdgeInsets.symmetric(vertical: 32, horizontal: 20),
+            child: _localTodayBreakdown.isEmpty
+                ? Column(
+                    children: [
+                      Text(
+                        _formatDuration(_localTodayTotalMinutes),
+                        style: const TextStyle(
+                          fontSize: 44,
+                          fontWeight: FontWeight.bold,
+                          color: Color(0xFF18181B),
+                          letterSpacing: -1.0,
+                        ),
+                      ),
+                      const SizedBox(height: 12),
+                      const Text(
                         'No app usage detected yet today. Try using some apps!',
                         style: TextStyle(color: Color(0xFF71717A), fontSize: 13),
                         textAlign: TextAlign.center,
                       ),
-                    ),
-                  );
-                }
-                final app = _localTodayBreakdown[index];
-                return Padding(
-                  padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 16),
-                  child: Row(
-                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                    children: [
-                      Expanded(
-                        child: Text(
-                          app.appName,
-                          style: const TextStyle(
-                            fontSize: 14,
-                            fontWeight: FontWeight.w500,
-                            color: Color(0xFF18181B),
-                          ),
-                          overflow: TextOverflow.ellipsis,
-                        ),
-                      ),
-                      Text(
-                        _formatDuration(app.minutes),
-                        style: const TextStyle(
-                          fontSize: 14,
-                          fontFamily: 'monospace',
-                          fontWeight: FontWeight.bold,
-                          color: Color(0xFF18181B),
-                        ),
-                      ),
                     ],
+                  )
+                : ScreenTimeRingChart(
+                    totalMinutes: _localTodayTotalMinutes,
+                    breakdown: _localTodayBreakdown,
+                    centerLabel: 'TODAY',
+                    maxLegendItems: 6,
+                    formatDuration: _formatDuration,
                   ),
-                );
-              },
-            ),
           ),
         ),
       ],
@@ -1369,38 +1359,23 @@ class _LeaderboardViewState extends State<LeaderboardView> {
                             letterSpacing: 1.0,
                           ),
                         ),
-                        const SizedBox(height: 10),
+                        const SizedBox(height: 14),
                         if (missingPermission)
                           const Text(
                             'Please grant Usage Access permission to view details.',
                             style: TextStyle(fontSize: 12, color: Color(0xFFEF4444), fontStyle: FontStyle.italic),
                           )
-                        else if (breakdown.isEmpty)
-                          const Text(
-                            'No usage data recorded.',
-                            style: TextStyle(fontSize: 12, color: Color(0xFF71717A), fontStyle: FontStyle.italic),
-                          )
                         else
-                          ...breakdown.take(4).map((app) => Padding(
-                                padding: const EdgeInsets.only(bottom: 6.0),
-                                child: Row(
-                                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                                  children: [
-                                    Text(
-                                      app.appName,
-                                      style: const TextStyle(fontSize: 12, color: Color(0xFF52525B)),
-                                    ),
-                                    Text(
-                                      widget.formatDuration(app.minutes),
-                                      style: const TextStyle(
-                                        fontSize: 12,
-                                        fontFamily: 'monospace',
-                                        color: Color(0xFF71717A),
-                                      ),
-                                    ),
-                                  ],
-                                ),
-                              )),
+                          ScreenTimeRingChart(
+                            totalMinutes: minutes,
+                            breakdown: breakdown,
+                            compact: true,
+                            ringSize: 96,
+                            strokeWidth: 12,
+                            maxLegendItems: 3,
+                            centerLabel: _timeframe == 'today' ? 'TODAY' : 'WEEK',
+                            formatDuration: widget.formatDuration,
+                          ),
                       ],
                     ),
                   ),
@@ -1733,6 +1708,11 @@ class _SettingsViewState extends State<SettingsView> {
                   controller: _memberIdController,
                   decoration: _buildInputDecoration('Enter family member ID (e.g. 1)'),
                   style: const TextStyle(fontSize: 14, color: Color(0xFF18181B)),
+                ),
+                const SizedBox(height: 6),
+                const Text(
+                  'Uniquely identifies this device on the leaderboard. Automatically generated from your device ID so stats persist across reinstalls.',
+                  style: TextStyle(fontSize: 11, color: Color(0xFF71717A), height: 1.3),
                 ),
               ],
             ),

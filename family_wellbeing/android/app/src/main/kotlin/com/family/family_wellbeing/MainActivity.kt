@@ -56,6 +56,30 @@ class MainActivity : FlutterActivity() {
                         result.error("ERROR", "Failed to fetch local stats: ${e.message}", null)
                     }
                 }
+                "getDeviceMetadata" -> {
+                    try {
+                        val manufacturer = android.os.Build.MANUFACTURER ?: "Unknown"
+                        val model = android.os.Build.MODEL ?: "Device"
+                        val deviceName = if (model.startsWith(manufacturer, ignoreCase = true)) {
+                            model
+                        } else {
+                            "${manufacturer.substring(0, 1).uppercase() + manufacturer.substring(1)} $model"
+                        }
+                        
+                        val androidId = Settings.Secure.getString(
+                            contentResolver,
+                            Settings.Secure.ANDROID_ID
+                        ) ?: "unknown_device"
+                        
+                        val resultMap = mapOf(
+                            "deviceName" to deviceName,
+                            "deviceId" to androidId
+                        )
+                        result.success(resultMap)
+                    } catch (e: Exception) {
+                        result.error("ERROR", "Failed to fetch device metadata: ${e.message}", null)
+                    }
+                }
                 else -> {
                     result.notImplemented()
                 }
