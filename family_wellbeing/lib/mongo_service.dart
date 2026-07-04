@@ -53,8 +53,8 @@ class MongoDbService {
     }
   }
 
-  /// Fetch all usage records
-  Future<List<UsageRecord>> fetchAllUsageRecords(String rawUri) async {
+  /// Fetch all usage records since sinceDate (optimized)
+  Future<List<UsageRecord>> fetchAllUsageRecords(String rawUri, {String? sinceDate}) async {
     final uri = _getFormattedUri(rawUri);
     if (uri.isEmpty) return [];
     
@@ -64,7 +64,15 @@ class MongoDbService {
       await db.open();
       
       final collection = db.collection('daily_usage');
-      final List<Map<String, dynamic>> docs = await collection.find().toList();
+      
+      // Support querying both DateType and StringType for backward compatibility
+      SelectorBuilder selector = where;
+      if (sinceDate != null) {
+        final parsedDate = DateTime.parse('${sinceDate}T00:00:00Z');
+        selector = where.gte('date', parsedDate).or(where.gte('date', sinceDate));
+      }
+      
+      final List<Map<String, dynamic>> docs = await collection.find(selector).toList();
       
       final List<UsageRecord> records = [];
       for (final doc in docs) {
@@ -78,10 +86,19 @@ class MongoDbService {
           );
         }).toList();
 
+        final rawDate = doc['date'];
+        String dateStr = '';
+        if (rawDate is DateTime) {
+          final utcDate = rawDate.toUtc();
+          dateStr = '${utcDate.year}-${utcDate.month.toString().padLeft(2, '0')}-${utcDate.day.toString().padLeft(2, '0')}';
+        } else {
+          dateStr = rawDate as String? ?? '';
+        }
+
         records.add(UsageRecord(
           id: doc['_id'] as String? ?? '',
           memberId: doc['memberId'] as String? ?? '',
-          date: doc['date'] as String? ?? '',
+          date: dateStr,
           totalScreenTimeMinutes: (doc['totalScreenTimeMinutes'] as num? ?? 0).toInt(),
           appBreakdown: appBreakdown,
           isComplete: doc['isComplete'] as bool? ?? false,
@@ -112,7 +129,7 @@ class MongoDbService {
       final doc = {
         '_id': record.id,
         'memberId': record.memberId,
-        'date': record.date,
+        'date': DateTime.parse('${record.date}T00:00:00Z'),
         'totalScreenTimeMinutes': record.totalScreenTimeMinutes,
         'isComplete': record.isComplete,
         'syncedAt': DateTime.now().millisecondsSinceEpoch,
@@ -132,6 +149,79 @@ class MongoDbService {
     } catch (e) {
       print("Upsert record failed: $e");
       return false;
+    } finally {
+      if (db != null) {
+        try {
+          await db.close();
+        } catch (_) {}
+      }
+    }
+  }
+
+  /// Upsert a user profile in the 'users' collection
+  Future<bool> upsertUserProfile(String rawUri, String memberId, String displayName, String deviceModel) async {
+    final uri = _getFormattedUri(rawUri);
+    if (uri.isEmpty) return false;
+    
+    Db? db;
+    try {
+      db = await Db.create(uri);
+      await db.open();
+      
+      final collection = db.collection('users');
+      
+      final doc = {
+        '_id': memberId,
+        'displayName': displayName,
+        'deviceModel': deviceModel,
+        'lastSeen': DateTime.now().millisecondsSinceEpoch,
+      };
+
+      await collection.update(
+        where.eq('_id', memberId),
+        doc,
+        upsert: true,
+      );
+      return true;
+    } catch (e) {
+      print("Upsert user profile failed: $e");
+      return false;
+    } finally {
+      if (db != null) {
+        try {
+          await db.close();
+        } catch (_) {}
+      }
+    }
+  }
+
+  /// Fetch all user profiles from the 'users' collection
+  Future<Map<String, Map<String, String>>> fetchUserProfiles(String rawUri) async {
+    final uri = _getFormattedUri(rawUri);
+    if (uri.isEmpty) return {};
+    
+    Db? db;
+    try {
+      db = await Db.create(uri);
+      await db.open();
+      
+      final collection = db.collection('users');
+      final List<Map<String, dynamic>> docs = await collection.find().toList();
+      
+      final Map<String, Map<String, String>> profiles = {};
+      for (final doc in docs) {
+        final String id = doc['_id'] as String? ?? '';
+        if (id.isNotEmpty) {
+          profiles[id] = {
+            'displayName': doc['displayName'] as String? ?? '',
+            'deviceModel': doc['deviceModel'] as String? ?? '',
+          };
+        }
+      }
+      return profiles;
+    } catch (e) {
+      print("Fetch user profiles failed: $e");
+      return {};
     } finally {
       if (db != null) {
         try {

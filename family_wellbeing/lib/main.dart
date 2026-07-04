@@ -1,10 +1,15 @@
 import 'dart:math';
+import 'dart:ui';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:workmanager/workmanager.dart';
 import 'mongo_service.dart';
 import 'usage_ring_chart.dart';
+import 'theme_manager.dart';
+import 'member_detail_view.dart';
+import 'glass_bottom_nav.dart';
+import 'sliding_segment_control.dart';
 
 // ─── In-app debug logger ───────────────────────────────────────────────────
 class AppLogger {
@@ -76,6 +81,16 @@ Future<bool> runSync() async {
   if (mongoUri.isEmpty || memberId.isEmpty) {
     _log.log('runSync: aborted (missing configuration)');
     return false;
+  }
+
+  final String displayName = prefs.getString('displayName') ?? 'Family Member';
+  final String deviceModel = prefs.getString('deviceModel') ?? 'Android Device';
+  
+  // Upsert user profile to MongoDB
+  try {
+    await MongoDbService.instance.upsertUserProfile(mongoUri, memberId, displayName, deviceModel);
+  } catch (e) {
+    _log.log('runSync: failed to upsert user profile: $e');
   }
 
   // 1. Check permissions
@@ -167,8 +182,9 @@ Future<bool> runSync() async {
   return true;
 }
 
-void main() {
+void main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  await ThemeViewModel.instance.init();
   Workmanager().initialize(
     callbackDispatcher,
     isInDebugMode: false,
@@ -181,29 +197,16 @@ class FamilyWellbeingApp extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return MaterialApp(
-      title: 'Family Wellbeing',
-      debugShowCheckedModeBanner: false,
-      theme: ThemeData(
-        useMaterial3: true,
-        scaffoldBackgroundColor: const Color(0xFFF4F4F5), // Zinc light background
-        colorScheme: ColorScheme.fromSeed(
-          seedColor: const Color(0xFF18181B),
-          primary: const Color(0xFF18181B),
-          secondary: const Color(0xFFD85A30), // Warm clay accent
-          surface: const Color(0xFFFAFAFA),
-        ),
-        fontFamily: 'sans-serif',
-        cardTheme: CardThemeData(
-          color: const Color(0xFFFAFAFA),
-          elevation: 0,
-          shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(20),
-            side: const BorderSide(color: Color(0xFFE4E4E7), width: 1),
-          ),
-        ),
-      ),
-      home: const MainLayout(),
+    return ListenableBuilder(
+      listenable: ThemeViewModel.instance,
+      builder: (context, _) {
+        return MaterialApp(
+          title: 'Family Wellbeing',
+          debugShowCheckedModeBanner: false,
+          theme: ThemeViewModel.instance.getThemeData(),
+          home: const MainLayout(),
+        );
+      },
     );
   }
 }
@@ -238,6 +241,8 @@ class AppUsage {
 class UsageRecord {
   final String id;
   final String memberId;
+  final String memberName;
+  final String deviceModel;
   final String date;
   final int totalScreenTimeMinutes;
   final List<AppUsage> appBreakdown;
@@ -246,6 +251,8 @@ class UsageRecord {
   UsageRecord({
     required this.id,
     required this.memberId,
+    this.memberName = '',
+    this.deviceModel = '',
     required this.date,
     required this.totalScreenTimeMinutes,
     required this.appBreakdown,
@@ -267,6 +274,7 @@ class _MainLayoutState extends State<MainLayout> with WidgetsBindingObserver {
   // Preferences State
   String _displayName = 'You';
   String _memberId = '1';
+  String _deviceModel = 'Android Device';
   String _mongoUri = '';
 
   // Local Usage Stats State
@@ -275,7 +283,9 @@ class _MainLayoutState extends State<MainLayout> with WidgetsBindingObserver {
 
   // Database / Sync State
   List<UsageRecord> _dbRecords = [];
+  Map<String, Map<String, String>> _userProfiles = {};
   bool _isSyncing = false;
+  bool _showSyncIndicator = false;
   DateTime? _lastSynced;
   bool _hasPermission = false;
   bool _mongoConnected = false;  // true only when real records fetched from Atlas
@@ -322,33 +332,35 @@ class _MainLayoutState extends State<MainLayout> with WidgetsBindingObserver {
     var name = prefs.getString('displayName') ?? 'You';
     var id = prefs.getString('memberId') ?? '1';
     final uri = prefs.getString('mongoUri') ?? '';
+    var model = prefs.getString('deviceModel') ?? 'Android Device';
 
-    if (id == '1' || name == 'You') {
-      try {
-        const platform = MethodChannel('com.family.wellbeing/stats');
-        final Map<dynamic, dynamic>? metadata = 
-            await platform.invokeMethod<Map<dynamic, dynamic>>('getDeviceMetadata');
-        if (metadata != null) {
-          final String deviceName = metadata['deviceName'] as String? ?? 'Device';
-          final String deviceId = metadata['deviceId'] as String? ?? 'unknown';
-          if (name == 'You') {
-            name = deviceName;
-            await prefs.setString('displayName', deviceName);
-          }
-          if (id == '1') {
-            id = deviceId;
-            await prefs.setString('memberId', deviceId);
-          }
+    try {
+      const platform = MethodChannel('com.family.wellbeing/stats');
+      final Map<dynamic, dynamic>? metadata = 
+          await platform.invokeMethod<Map<dynamic, dynamic>>('getDeviceMetadata');
+      if (metadata != null) {
+        final String deviceName = metadata['deviceName'] as String? ?? 'Device';
+        final String deviceId = metadata['deviceId'] as String? ?? 'unknown';
+        model = deviceName;
+        await prefs.setString('deviceModel', deviceName);
+        if (name == 'You') {
+          name = deviceName;
+          await prefs.setString('displayName', deviceName);
         }
-      } catch (e) {
-        _log.log('Error fetching device metadata: $e');
+        if (id == '1') {
+          id = deviceId;
+          await prefs.setString('memberId', deviceId);
+        }
       }
+    } catch (e) {
+      _log.log('Error fetching device metadata: $e');
     }
 
     setState(() {
       _displayName = name;
       _memberId = id;
       _mongoUri = uri;
+      _deviceModel = model;
     });
   }
 
@@ -364,6 +376,16 @@ class _MainLayoutState extends State<MainLayout> with WidgetsBindingObserver {
       _memberId = id;
       _mongoUri = uri;
     });
+
+    // Immediately push profile metadata changes to Atlas
+    if (uri.isNotEmpty && id.isNotEmpty) {
+      try {
+        await MongoDbService.instance.upsertUserProfile(uri, id, name, _deviceModel);
+        _log.log('Saved profile synced to Atlas.');
+      } catch (e) {
+        _log.log('Failed to sync profile changes: $e');
+      }
+    }
 
     // Run a full connection diagnostic immediately after saving
     await _testMongoConnection();
@@ -392,7 +414,10 @@ class _MainLayoutState extends State<MainLayout> with WidgetsBindingObserver {
 
   Future<void> _checkStatusAndFetchData() async {
     _log.log('checkStatus: starting (mongoUri=${_mongoUri.isNotEmpty ? "set" : "empty"})');
-    setState(() => _isSyncing = true);
+    setState(() {
+      _isSyncing = true;
+      _showSyncIndicator = true;
+    });
     
     // Check permission
     bool perm = false;
@@ -436,10 +461,21 @@ class _MainLayoutState extends State<MainLayout> with WidgetsBindingObserver {
     if (_mongoUri.isNotEmpty) {
       _log.log('fetchDbData: calling Dart mongo_dart...');
       try {
-        final List<UsageRecord> records = await MongoDbService.instance.fetchAllUsageRecords(_mongoUri);
-        _log.log('fetchDbData: got ${records.length} records');
+        // Fetch profiles first (optimized users collection query)
+        final Map<String, Map<String, String>> profiles = 
+            await MongoDbService.instance.fetchUserProfiles(_mongoUri);
+            
+        // Calculate date threshold for optimized daily_usage query: last 14 days
+        final thresholdDate = DateTime.now().subtract(const Duration(days: 14));
+        final thresholdDateStr = '${thresholdDate.year}-${thresholdDate.month.toString().padLeft(2, '0')}-${thresholdDate.day.toString().padLeft(2, '0')}';
+        
+        final List<UsageRecord> records = 
+            await MongoDbService.instance.fetchAllUsageRecords(_mongoUri, sinceDate: thresholdDateStr);
+            
+        _log.log('fetchDbData: got ${records.length} records (optimized since $thresholdDateStr) and ${profiles.length} profiles');
         setState(() {
           _dbRecords = records;
+          _userProfiles = profiles;
           _mongoConnected = true;
           _dbError = null;
         });
@@ -461,6 +497,11 @@ class _MainLayoutState extends State<MainLayout> with WidgetsBindingObserver {
     setState(() {
       _lastSynced = DateTime.now();
       _isSyncing = false;
+    });
+    Future.delayed(const Duration(seconds: 4), () {
+      if (mounted && !_isSyncing) {
+        setState(() => _showSyncIndicator = false);
+      }
     });
   }
 
@@ -486,9 +527,8 @@ class _MainLayoutState extends State<MainLayout> with WidgetsBindingObserver {
 
 
   List<Member> _getMembersList(List<UsageRecord> db) {
-    // Dynamically resolve unique member records from synced MongoDB Atlas docs
     final uniqueIds = db.map((r) => r.memberId).toSet();
-    uniqueIds.add(_memberId); // Ensure current user is present
+    uniqueIds.add(_memberId);
 
     final List<Member> dynamicMembers = [];
     final avatarColors = [
@@ -507,15 +547,27 @@ class _MainLayoutState extends State<MainLayout> with WidgetsBindingObserver {
         dynamicMembers.add(Member(
           id: id,
           name: _displayName,
-          deviceModel: 'This Device',
+          deviceModel: _deviceModel.isNotEmpty ? _deviceModel : 'This Device',
           avatarColor: const Color(0xFFD85A30),
         ));
       } else {
+        // Resolve display name and device model from the _userProfiles map!
+        final profile = _userProfiles[id];
+        String resolvedName = profile?['displayName'] ?? '';
+        String resolvedDevice = profile?['deviceModel'] ?? '';
+
+        if (resolvedName.isEmpty) {
+          resolvedName = 'Member ${id.length > 5 ? id.substring(0, 5) : id}';
+        }
+        if (resolvedDevice.isEmpty) {
+          resolvedDevice = 'Family Member';
+        }
+
         final colorIndex = id.hashCode.abs() % avatarColors.length;
         dynamicMembers.add(Member(
           id: id,
-          name: 'Member $id',
-          deviceModel: 'Family Member',
+          name: resolvedName,
+          deviceModel: resolvedDevice,
           avatarColor: avatarColors[colorIndex],
         ));
       }
@@ -535,6 +587,7 @@ class _MainLayoutState extends State<MainLayout> with WidgetsBindingObserver {
     final List<UsageRecord> currentDb = _dbRecords;
 
     return Scaffold(
+      extendBody: true,
       appBar: PreferredSize(
         preferredSize: const Size.fromHeight(70),
         child: _buildHeader(),
@@ -545,24 +598,32 @@ class _MainLayoutState extends State<MainLayout> with WidgetsBindingObserver {
             child: SingleChildScrollView(
               physics: const BouncingScrollPhysics(),
               child: Padding(
-                padding: const EdgeInsets.all(24.0),
+                padding: const EdgeInsets.only(left: 24.0, right: 24.0, top: 24.0, bottom: 120.0),
                 child: _buildActiveTabContent(currentDb),
               ),
             ),
           ),
           if (_activeTab != 'settings') _buildSyncIndicator(),
-          _buildBottomNavigation(),
         ],
       ),
+      bottomNavigationBar: _activeTab != 'settings'
+          ? GlassBottomNav(
+              activeTab: _activeTab,
+              onTabChanged: (tab) => setState(() => _activeTab = tab),
+            )
+          : null,
     );
   }
 
   Widget _buildHeader() {
+    final theme = Theme.of(context);
+    final isDark = theme.brightness == Brightness.dark;
+    
     return Container(
-      decoration: const BoxDecoration(
-        color: Colors.white,
+      decoration: BoxDecoration(
+        color: theme.cardColor,
         border: Border(
-          bottom: BorderSide(color: Color(0xFFE4E4E7), width: 1),
+          bottom: BorderSide(color: theme.dividerColor, width: 1),
         ),
       ),
       child: SafeArea(
@@ -577,20 +638,20 @@ class _MainLayoutState extends State<MainLayout> with WidgetsBindingObserver {
                     width: 32,
                     height: 32,
                     decoration: BoxDecoration(
-                      color: const Color(0xFF18181B),
+                      color: theme.colorScheme.primary,
                       borderRadius: BorderRadius.circular(8),
                     ),
-                    child: const Icon(
+                    child: Icon(
                       Icons.show_chart,
-                      color: Colors.white,
+                      color: isDark ? Colors.black : Colors.white,
                       size: 18,
                     ),
                   ),
                   const SizedBox(width: 10),
-                  const Text(
+                  Text(
                     'Wellbeing',
                     style: TextStyle(
-                      color: Color(0xFF18181B),
+                      color: theme.colorScheme.onSurface,
                       fontSize: 20,
                       fontWeight: FontWeight.bold,
                       letterSpacing: -0.5,
@@ -609,14 +670,16 @@ class _MainLayoutState extends State<MainLayout> with WidgetsBindingObserver {
                   height: 38,
                   decoration: BoxDecoration(
                     shape: BoxShape.circle,
-                    color: _activeTab == 'settings' ? const Color(0xFF18181B) : Colors.white,
+                    color: _activeTab == 'settings' ? theme.colorScheme.primary : theme.cardColor,
                     border: Border.all(
-                      color: _activeTab == 'settings' ? const Color(0xFF18181B) : const Color(0xFFE4E4E7),
+                      color: _activeTab == 'settings' ? theme.colorScheme.primary : theme.dividerColor,
                     ),
                   ),
                   child: Icon(
                     _activeTab == 'settings' ? Icons.keyboard_arrow_down : Icons.person_outline,
-                    color: _activeTab == 'settings' ? Colors.white : const Color(0xFF71717A),
+                    color: _activeTab == 'settings' 
+                        ? (isDark ? Colors.black : Colors.white) 
+                        : theme.colorScheme.onSurfaceVariant,
                     size: 20,
                   ),
                 ),
@@ -669,39 +732,81 @@ class _MainLayoutState extends State<MainLayout> with WidgetsBindingObserver {
       return _buildPermissionRequiredCard();
     }
 
+    final theme = Theme.of(context);
+
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: const [
-            Text(
-              'Overview',
-              style: TextStyle(
-                fontSize: 26,
-                color: Color(0xFF18181B),
-                fontWeight: FontWeight.bold,
-                letterSpacing: -0.5,
-              ),
+        Row(
+          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+          children: [
+            Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  'Overview',
+                  style: TextStyle(
+                    fontSize: 26,
+                    color: theme.colorScheme.onSurface,
+                    fontWeight: FontWeight.bold,
+                    letterSpacing: -0.5,
+                  ),
+                ),
+                const SizedBox(height: 4),
+                Text(
+                  'Your real screen time today.',
+                  style: TextStyle(
+                    fontSize: 14,
+                    color: theme.colorScheme.onSurfaceVariant,
+                  ),
+                ),
+              ],
             ),
-            SizedBox(height: 4),
-            Text(
-              'Your real screen time today.',
-              style: TextStyle(
-                fontSize: 14,
-                color: Color(0xFF71717A),
+            GestureDetector(
+              onTap: () {
+                final selfMember = Member(
+                  id: _memberId,
+                  name: _displayName,
+                  deviceModel: _deviceModel.isNotEmpty ? _deviceModel : 'This Device',
+                  avatarColor: const Color(0xFFD85A30),
+                );
+                Navigator.of(context).push(
+                  MaterialPageRoute(
+                    builder: (context) => MemberDetailView(
+                      member: selfMember,
+                      db: _dbRecords,
+                      formatDuration: _formatDuration,
+                      initialTimeframe: 'today',
+                    ),
+                  ),
+                );
+              },
+              child: Hero(
+                tag: 'avatar_$_memberId',
+                child: CircleAvatar(
+                  radius: 22,
+                  backgroundColor: const Color(0xFFD85A30),
+                  child: Text(
+                    _displayName.isNotEmpty ? _displayName[0].toUpperCase() : 'U',
+                    style: const TextStyle(
+                      color: Colors.white,
+                      fontWeight: FontWeight.bold,
+                      fontSize: 14,
+                    ),
+                  ),
+                ),
               ),
             ),
           ],
         ),
         const SizedBox(height: 24),
         
-        const Text(
+        Text(
           'App Breakdown',
           style: TextStyle(
             fontSize: 15,
             fontWeight: FontWeight.bold,
-            color: Color(0xFF18181B),
+            color: theme.colorScheme.onSurface,
           ),
         ),
         const SizedBox(height: 12),
@@ -713,17 +818,17 @@ class _MainLayoutState extends State<MainLayout> with WidgetsBindingObserver {
                     children: [
                       Text(
                         _formatDuration(_localTodayTotalMinutes),
-                        style: const TextStyle(
+                        style: TextStyle(
                           fontSize: 44,
                           fontWeight: FontWeight.bold,
-                          color: Color(0xFF18181B),
+                          color: theme.colorScheme.onSurface,
                           letterSpacing: -1.0,
                         ),
                       ),
                       const SizedBox(height: 12),
-                      const Text(
+                      Text(
                         'No app usage detected yet today. Try using some apps!',
-                        style: TextStyle(color: Color(0xFF71717A), fontSize: 13),
+                        style: TextStyle(color: theme.colorScheme.onSurfaceVariant, fontSize: 13),
                         textAlign: TextAlign.center,
                       ),
                     ],
@@ -742,14 +847,17 @@ class _MainLayoutState extends State<MainLayout> with WidgetsBindingObserver {
   }
 
   Widget _buildPermissionRequiredCard() {
+    final theme = Theme.of(context);
+    final isDark = theme.brightness == Brightness.dark;
+
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        const Text(
+        Text(
           'Overview',
           style: TextStyle(
             fontSize: 26,
-            color: Color(0xFF18181B),
+            color: theme.colorScheme.onSurface,
             fontWeight: FontWeight.bold,
             letterSpacing: -0.5,
           ),
@@ -767,20 +875,20 @@ class _MainLayoutState extends State<MainLayout> with WidgetsBindingObserver {
                   size: 32,
                 ),
                 const SizedBox(height: 16),
-                const Text(
+                Text(
                   'Permission Required',
                   style: TextStyle(
                     fontSize: 18,
                     fontWeight: FontWeight.bold,
-                    color: Color(0xFF18181B),
+                    color: theme.colorScheme.onSurface,
                   ),
                 ),
                 const SizedBox(height: 8),
-                const Text(
+                Text(
                   'To display actual screen time data and your daily apps usage, this app requires standard Android Usage Stats permission.',
                   style: TextStyle(
                     fontSize: 14,
-                    color: Color(0xFF71717A),
+                    color: theme.colorScheme.onSurfaceVariant,
                     height: 1.4,
                   ),
                 ),
@@ -788,8 +896,8 @@ class _MainLayoutState extends State<MainLayout> with WidgetsBindingObserver {
                 ElevatedButton(
                   onPressed: _requestUsagePermission,
                   style: ElevatedButton.styleFrom(
-                    backgroundColor: const Color(0xFF18181B),
-                    foregroundColor: Colors.white,
+                    backgroundColor: theme.colorScheme.primary,
+                    foregroundColor: isDark ? Colors.black : Colors.white,
                     minimumSize: const Size(double.infinity, 46),
                     shape: RoundedRectangleBorder(
                       borderRadius: BorderRadius.circular(10),
@@ -814,160 +922,100 @@ class _MainLayoutState extends State<MainLayout> with WidgetsBindingObserver {
         ? '${_lastSynced!.hour.toString().padLeft(2, '0')}:${_lastSynced!.minute.toString().padLeft(2, '0')}'
         : '';
         
-    return Container(
-      padding: const EdgeInsets.symmetric(vertical: 12),
+    final show = _showSyncIndicator;
+    return AnimatedContainer(
+      duration: const Duration(milliseconds: 300),
+      curve: Curves.fastOutSlowIn,
+      height: show ? 52.0 : 0.0,
+      clipBehavior: Clip.antiAlias,
       decoration: const BoxDecoration(
-        color: Colors.white,
-        border: Border(
-          top: BorderSide(color: Color(0xFFF3F4F6), width: 1),
-        ),
+        color: Colors.transparent,
       ),
-      child: Center(
+      child: AnimatedOpacity(
+        duration: const Duration(milliseconds: 200),
+        opacity: show ? 1.0 : 0.0,
         child: Container(
-          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
-          decoration: BoxDecoration(
-            color: Colors.white,
-            borderRadius: BorderRadius.circular(20),
-            border: Border.all(color: const Color(0xFFE4E4E7), width: 1),
-          ),
-          child: Row(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              if (_isSyncing)
-                const SizedBox(
-                  width: 10,
-                  height: 10,
-                  child: CircularProgressIndicator(
-                    strokeWidth: 1.5,
-                    color: Color(0xFF71717A),
+          padding: const EdgeInsets.symmetric(vertical: 8),
+          child: Center(
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
+              decoration: BoxDecoration(
+                color: Colors.white,
+                borderRadius: BorderRadius.circular(20),
+                border: Border.all(color: const Color(0xFFE4E4E7), width: 1),
+                boxShadow: [
+                  BoxShadow(
+                    color: Colors.black.withOpacity(0.04),
+                    blurRadius: 4,
+                    offset: const Offset(0, 2),
                   ),
-                )
-              else
-                const Icon(
-                  Icons.check,
-                  size: 10,
-                  color: Color(0xFF10B981),
-                ),
-              const SizedBox(width: 6),
-              Text(
-                _isSyncing ? 'Syncing...' : 'Synced $syncedString',
-                style: const TextStyle(
-                  fontSize: 10,
-                  fontFamily: 'monospace',
-                  color: Color(0xFF71717A),
-                ),
+                ],
               ),
-              if (!_mongoConnected) ...[
-                const SizedBox(width: 6),
-                Container(
-                  padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 0.5),
-                  decoration: BoxDecoration(
-                    color: const Color(0xFFFEE2E2),
-                    borderRadius: BorderRadius.circular(3),
-                    border: Border.all(color: const Color(0xFFFCA5A5)),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  if (_isSyncing)
+                    const SizedBox(
+                      width: 10,
+                      height: 10,
+                      child: CircularProgressIndicator(
+                        strokeWidth: 1.5,
+                        color: Color(0xFF71717A),
+                      ),
+                    )
+                  else
+                    const Icon(
+                      Icons.check,
+                      size: 10,
+                      color: Color(0xFF10B981),
+                    ),
+                  const SizedBox(width: 6),
+                  Text(
+                    _isSyncing ? 'Syncing...' : 'Synced $syncedString',
+                    style: const TextStyle(
+                      fontSize: 10,
+                      fontFamily: 'monospace',
+                      color: Color(0xFF71717A),
+                    ),
                   ),
-                  child: const Text(
-                    'OFFLINE',
-                    style: TextStyle(fontSize: 8, color: Color(0xFFDC2626), fontWeight: FontWeight.bold),
-                  ),
-                )
-              ] else ...[
-                const SizedBox(width: 6),
-                Container(
-                  padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 0.5),
-                  decoration: BoxDecoration(
-                    color: const Color(0xFFD1FAE5),
-                    borderRadius: BorderRadius.circular(3),
-                    border: Border.all(color: const Color(0xFFA7F3D0)),
-                  ),
-                  child: const Text(
-                    'ATLAS',
-                    style: TextStyle(fontSize: 8, color: Color(0xFF065F46), fontWeight: FontWeight.bold),
-                  ),
-                )
-              ]
-            ],
+                  if (!_mongoConnected) ...[
+                    const SizedBox(width: 6),
+                    Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 0.5),
+                      decoration: BoxDecoration(
+                        color: const Color(0xFFFEE2E2),
+                        borderRadius: BorderRadius.circular(3),
+                        border: Border.all(color: const Color(0xFFFCA5A5)),
+                      ),
+                      child: const Text(
+                        'OFFLINE',
+                        style: TextStyle(fontSize: 8, color: Color(0xFFDC2626), fontWeight: FontWeight.bold),
+                      ),
+                    )
+                  ] else ...[
+                    const SizedBox(width: 6),
+                    Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 0.5),
+                      decoration: BoxDecoration(
+                        color: const Color(0xFFD1FAE5),
+                        borderRadius: BorderRadius.circular(3),
+                        border: Border.all(color: const Color(0xFFA7F3D0)),
+                      ),
+                      child: const Text(
+                        'ATLAS',
+                        style: TextStyle(fontSize: 8, color: Color(0xFF065F46), fontWeight: FontWeight.bold),
+                      ),
+                    )
+                  ]
+                ],
+              ),
+            ),
           ),
         ),
       ),
     );
   }
 
-  Widget _buildBottomNavigation() {
-    return Container(
-      height: 68,
-      decoration: const BoxDecoration(
-        color: Colors.white,
-        border: Border(
-          top: BorderSide(color: Color(0xFFE4E4E7), width: 1),
-        ),
-      ),
-      child: Row(
-        mainAxisAlignment: MainAxisAlignment.spaceEvenly,
-        children: [
-          Expanded(
-            child: GestureDetector(
-              onTap: () => setState(() => _activeTab = 'dashboard'),
-              child: Container(
-                color: Colors.transparent,
-                child: Column(
-                  mainAxisAlignment: MainAxisAlignment.center,
-                  children: [
-                    Icon(
-                      Icons.show_chart,
-                      color: _activeTab == 'dashboard' ? const Color(0xFF18181B) : const Color(0xFF71717A).withOpacity(0.5),
-                      size: 22,
-                    ),
-                    const SizedBox(height: 4),
-                    Text(
-                      'Overview',
-                      style: TextStyle(
-                        fontSize: 11,
-                        fontWeight: FontWeight.bold,
-                        color: _activeTab == 'dashboard' ? const Color(0xFF18181B) : const Color(0xFF71717A).withOpacity(0.5),
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-            ),
-          ),
-          Container(
-            width: 1,
-            height: 24,
-            color: const Color(0xFFE4E4E7),
-          ),
-          Expanded(
-            child: GestureDetector(
-              onTap: () => setState(() => _activeTab = 'leaderboard'),
-              child: Container(
-                color: Colors.transparent,
-                child: Column(
-                  mainAxisAlignment: MainAxisAlignment.center,
-                  children: [
-                    Icon(
-                      Icons.bar_chart,
-                      color: _activeTab == 'leaderboard' ? const Color(0xFF18181B) : const Color(0xFF71717A).withOpacity(0.5),
-                      size: 22,
-                    ),
-                    const SizedBox(height: 4),
-                    Text(
-                      'Ranks',
-                      style: TextStyle(
-                        fontSize: 11,
-                        fontWeight: FontWeight.bold,
-                        color: _activeTab == 'leaderboard' ? const Color(0xFF18181B) : const Color(0xFF71717A).withOpacity(0.5),
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-            ),
-          ),
-        ],
-      ),
-    );
-  }
 }
 
 // Leaderboard Section
@@ -1004,14 +1052,23 @@ class LeaderboardView extends StatefulWidget {
 class _LeaderboardViewState extends State<LeaderboardView> {
   String _timeframe = 'today';
   String? _expandedUserId;
+  List<Map<String, dynamic>> _cachedRankedData = [];
 
   @override
-  Widget build(BuildContext context) {
-    // --- Guard: not connected ---
-    if (!widget.mongoConnected) {
-      return _buildNotConnectedState(context);
-    }
+  void initState() {
+    super.initState();
+    _recalculateLeaderboard();
+  }
 
+  @override
+  void didUpdateWidget(covariant LeaderboardView oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.db != widget.db || oldWidget.members != widget.members || oldWidget.hasPermission != widget.hasPermission) {
+      _recalculateLeaderboard();
+    }
+  }
+
+  void _recalculateLeaderboard() {
     final today = DateTime.now();
     final todayStr = '${today.year}-${today.month.toString().padLeft(2,'0')}-${today.day.toString().padLeft(2,'0')}';
     final weekDates = List.generate(7, (i) {
@@ -1019,8 +1076,7 @@ class _LeaderboardViewState extends State<LeaderboardView> {
       return '${d.year}-${d.month.toString().padLeft(2,'0')}-${d.day.toString().padLeft(2,'0')}';
     });
 
-    // Process records
-    final List<Map<String, dynamic>> rankedData = widget.members.map((member) {
+    final List<Map<String, dynamic>> processed = widget.members.map((member) {
       int totalMinutes = 0;
       final Map<String, int> combinedBreakdown = {};
       bool isRequiredPermissionMissing = false;
@@ -1051,31 +1107,47 @@ class _LeaderboardViewState extends State<LeaderboardView> {
         }
       }
 
-      final sortedBreakdown = combinedBreakdown.entries
-          .map((e) => AppUsage(appName: e.key, packageName: '', minutes: e.value))
-          .toList()
-        ..sort((a, b) => b.minutes.compareTo(a.minutes));
+      final List<AppUsage> breakdown = combinedBreakdown.entries.map((e) {
+        return AppUsage(appName: e.key, packageName: '', minutes: e.value);
+      }).toList()..sort((a, b) => b.minutes.compareTo(a.minutes));
 
       return {
         'member': member,
         'minutes': totalMinutes,
-        'breakdown': sortedBreakdown,
+        'breakdown': breakdown,
         'missingPermission': isRequiredPermissionMissing,
       };
     }).toList();
 
     // Sort ascending (lowest screen time wins). If permission missing, rank at the bottom.
-    rankedData.sort((a, b) {
-      if (a['missingPermission'] as bool) return 1;
-      if (b['missingPermission'] as bool) return -1;
-      return (a['minutes'] as int).compareTo(b['minutes'] as int);
+    processed.sort((a, b) {
+      final bool aMissing = a['missingPermission'] as bool;
+      final bool bMissing = b['missingPermission'] as bool;
+      if (aMissing && !bMissing) return 1;
+      if (!aMissing && bMissing) return -1;
+      final int aMins = a['minutes'] as int;
+      final int bMins = b['minutes'] as int;
+      return aMins.compareTo(bMins);
     });
+
+    _cachedRankedData = processed;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    // --- Guard: not connected ---
+    if (!widget.mongoConnected) {
+      return _buildNotConnectedState(context);
+    }
+
+    final rankedData = _cachedRankedData;
 
     // If connected but no records at all yet
     if (rankedData.every((d) => (d['minutes'] as int) == 0 && !(d['missingPermission'] as bool))) {
       return _buildEmptyAtlasState();
     }
 
+    final theme = Theme.of(context);
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -1085,11 +1157,11 @@ class _LeaderboardViewState extends State<LeaderboardView> {
             Row(
               mainAxisAlignment: MainAxisAlignment.spaceBetween,
               children: [
-                const Text(
+                Text(
                   'Leaderboard',
                   style: TextStyle(
                     fontSize: 26,
-                    color: Color(0xFF18181B),
+                    color: theme.colorScheme.onSurface,
                     fontWeight: FontWeight.bold,
                     letterSpacing: -0.5,
                   ),
@@ -1113,33 +1185,30 @@ class _LeaderboardViewState extends State<LeaderboardView> {
               ],
             ),
             const SizedBox(height: 4),
-            const Text(
+            Text(
               'Real live family stats synced from Atlas.',
               style: TextStyle(
                 fontSize: 14,
-                color: Color(0xFF71717A),
+                color: theme.colorScheme.onSurfaceVariant,
               ),
             ),
           ],
         ),
         const SizedBox(height: 20),
 
-        // Segmented Control
-        Container(
-          decoration: const BoxDecoration(
-            border: Border(
-              bottom: BorderSide(color: Color(0xFFE4E4E7), width: 1),
-            ),
-          ),
-          child: Row(
-            children: [
-              _buildSegmentTab('Today', 'today'),
-              const SizedBox(width: 16),
-              _buildSegmentTab('This Week', 'weekly'),
-            ],
-          ),
+        // Timeframe Segment Selector - sliding rounded switcher
+        SlidingSegmentControl(
+          selectedValue: _timeframe,
+          values: const ['today', 'weekly'],
+          labels: const ['Today', 'This Week'],
+          onValueChanged: (val) {
+            setState(() {
+              _timeframe = val;
+              _recalculateLeaderboard();
+            });
+          },
         ),
-        const SizedBox(height: 16),
+        const SizedBox(height: 20),
 
         // Leaderboard List
         ListView.separated(
@@ -1156,7 +1225,6 @@ class _LeaderboardViewState extends State<LeaderboardView> {
 
             final bool isWinner = index == 0 && !missingPermission;
             final bool isMe = member.id == widget.myId;
-            final bool isExpanded = _expandedUserId == member.id;
 
             final double maxMinutes = _timeframe == 'today' ? 400.0 : 2800.0;
             final double percentage = missingPermission ? 0.0 : min((minutes / maxMinutes), 1.0);
@@ -1165,22 +1233,26 @@ class _LeaderboardViewState extends State<LeaderboardView> {
               children: [
                 GestureDetector(
                   onTap: () {
-                    setState(() {
-                      _expandedUserId = isExpanded ? null : member.id;
-                    });
+                    Navigator.of(context).push(
+                      MaterialPageRoute(
+                        builder: (context) => MemberDetailView(
+                          member: member,
+                          db: widget.db,
+                          formatDuration: widget.formatDuration,
+                          initialTimeframe: _timeframe,
+                        ),
+                      ),
+                    );
                   },
                   child: Container(
                     padding: const EdgeInsets.all(14),
                     decoration: BoxDecoration(
-                      color: const Color(0xFFFAFAFA),
-                      borderRadius: BorderRadius.only(
-                        topLeft: const Radius.circular(16),
-                        topRight: const Radius.circular(16),
-                        bottomLeft: Radius.circular(isExpanded ? 0 : 16),
-                        bottomRight: Radius.circular(isExpanded ? 0 : 16),
-                      ),
+                      color: Theme.of(context).cardColor,
+                      borderRadius: BorderRadius.circular(16),
                       border: Border.all(
-                        color: isMe ? const Color(0xFF18181B) : const Color(0xFFE4E4E7),
+                        color: isMe
+                            ? Theme.of(context).colorScheme.primary
+                            : Theme.of(context).dividerColor,
                         width: isMe ? 1.5 : 1.0,
                       ),
                     ),
@@ -1201,21 +1273,24 @@ class _LeaderboardViewState extends State<LeaderboardView> {
                         ),
                         const SizedBox(width: 6),
 
-                        // Avatar
-                        Container(
-                          width: 34,
-                          height: 34,
-                          decoration: BoxDecoration(
-                            shape: BoxShape.circle,
-                            color: member.avatarColor,
-                          ),
-                          child: Center(
-                            child: Text(
-                              member.name.substring(0, 1).toUpperCase(),
-                              style: const TextStyle(
-                                color: Colors.white,
-                                fontWeight: FontWeight.bold,
-                                fontSize: 13,
+                        // Hero Avatar
+                        Hero(
+                          tag: 'avatar_${member.id}',
+                          child: Container(
+                            width: 34,
+                            height: 34,
+                            decoration: BoxDecoration(
+                              shape: BoxShape.circle,
+                              color: member.avatarColor,
+                            ),
+                            child: Center(
+                              child: Text(
+                                member.name.substring(0, 1).toUpperCase(),
+                                style: const TextStyle(
+                                  color: Colors.white,
+                                  fontWeight: FontWeight.bold,
+                                  fontSize: 13,
+                                ),
                               ),
                             ),
                           ),
@@ -1232,12 +1307,18 @@ class _LeaderboardViewState extends State<LeaderboardView> {
                                 children: [
                                   Row(
                                     children: [
-                                      Text(
-                                        member.name,
-                                        style: TextStyle(
-                                          fontSize: 14,
-                                          fontWeight: isMe ? FontWeight.bold : FontWeight.w600,
-                                          color: const Color(0xFF18181B),
+                                      Hero(
+                                        tag: 'name_${member.id}',
+                                        child: Material(
+                                          color: Colors.transparent,
+                                          child: Text(
+                                            member.name,
+                                            style: TextStyle(
+                                              fontSize: 14,
+                                              fontWeight: isMe ? FontWeight.bold : FontWeight.w600,
+                                              color: Theme.of(context).colorScheme.onSurface,
+                                            ),
+                                          ),
                                         ),
                                       ),
                                       if (isWinner) ...[
@@ -1264,20 +1345,13 @@ class _LeaderboardViewState extends State<LeaderboardView> {
                                   Row(
                                     children: [
                                       if (missingPermission)
-                                        Container(
-                                          padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-                                          decoration: BoxDecoration(
-                                            color: const Color(0xFFFEF2F2),
-                                            borderRadius: BorderRadius.circular(4),
-                                            border: Border.all(color: const Color(0xFFFEE2E2)),
-                                          ),
-                                          child: const Text(
-                                            'LOCK',
-                                            style: TextStyle(
-                                              fontSize: 8,
-                                              fontWeight: FontWeight.bold,
-                                              color: Color(0xFFEF4444),
-                                            ),
+                                        const Text(
+                                          'ERR',
+                                          style: TextStyle(
+                                            fontSize: 11,
+                                            fontFamily: 'monospace',
+                                            fontWeight: FontWeight.bold,
+                                            color: Color(0xFFEF4444),
                                           ),
                                         )
                                       else
@@ -1287,13 +1361,15 @@ class _LeaderboardViewState extends State<LeaderboardView> {
                                             fontSize: 14,
                                             fontFamily: 'monospace',
                                             fontWeight: isMe ? FontWeight.bold : FontWeight.w600,
-                                            color: isMe ? const Color(0xFF18181B) : const Color(0xFF52525B),
+                                            color: isMe
+                                                ? Theme.of(context).colorScheme.primary
+                                                : Theme.of(context).colorScheme.onSurfaceVariant,
                                           ),
                                         ),
                                       const SizedBox(width: 4),
                                       Icon(
-                                        isExpanded ? Icons.keyboard_arrow_up : Icons.keyboard_arrow_down,
-                                        color: const Color(0xFFA1A1AA),
+                                        Icons.chevron_right_rounded,
+                                        color: Theme.of(context).colorScheme.onSurfaceVariant,
                                         size: 16,
                                       ),
                                     ],
@@ -1306,7 +1382,7 @@ class _LeaderboardViewState extends State<LeaderboardView> {
                                 height: 4,
                                 width: double.infinity,
                                 decoration: BoxDecoration(
-                                  color: const Color(0xFFE4E4E7),
+                                  color: Theme.of(context).dividerColor,
                                   borderRadius: BorderRadius.circular(2),
                                 ),
                                 child: Align(
@@ -1315,9 +1391,11 @@ class _LeaderboardViewState extends State<LeaderboardView> {
                                     widthFactor: percentage,
                                     child: Container(
                                       decoration: BoxDecoration(
-                                        color: isWinner 
-                                            ? const Color(0xFFD85A30) 
-                                            : (isMe ? const Color(0xFF18181B) : const Color(0xFFD4D4D8)),
+                                        color: isWinner
+                                            ? const Color(0xFFD85A30)
+                                            : (isMe
+                                                ? Theme.of(context).colorScheme.primary
+                                                : const Color(0xFFD4D4D8)),
                                         borderRadius: BorderRadius.circular(2),
                                       ),
                                     ),
@@ -1331,54 +1409,6 @@ class _LeaderboardViewState extends State<LeaderboardView> {
                     ),
                   ),
                 ),
-                if (isExpanded)
-                  Container(
-                    width: double.infinity,
-                    padding: const EdgeInsets.all(16),
-                    decoration: BoxDecoration(
-                      color: const Color(0xFFFAFAFA),
-                      borderRadius: const BorderRadius.only(
-                        bottomLeft: Radius.circular(16),
-                        bottomRight: Radius.circular(16),
-                      ),
-                      border: Border(
-                        left: BorderSide(color: isMe ? const Color(0xFF18181B) : const Color(0xFFE4E4E7), width: isMe ? 1.5 : 1.0),
-                        right: BorderSide(color: isMe ? const Color(0xFF18181B) : const Color(0xFFE4E4E7), width: isMe ? 1.5 : 1.0),
-                        bottom: BorderSide(color: isMe ? const Color(0xFF18181B) : const Color(0xFFE4E4E7), width: isMe ? 1.5 : 1.0),
-                      ),
-                    ),
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        const Text(
-                          'APP BREAKDOWN',
-                          style: TextStyle(
-                            fontSize: 9,
-                            fontWeight: FontWeight.bold,
-                            color: Color(0xFF71717A),
-                            letterSpacing: 1.0,
-                          ),
-                        ),
-                        const SizedBox(height: 14),
-                        if (missingPermission)
-                          const Text(
-                            'Please grant Usage Access permission to view details.',
-                            style: TextStyle(fontSize: 12, color: Color(0xFFEF4444), fontStyle: FontStyle.italic),
-                          )
-                        else
-                          ScreenTimeRingChart(
-                            totalMinutes: minutes,
-                            breakdown: breakdown,
-                            compact: true,
-                            ringSize: 96,
-                            strokeWidth: 12,
-                            maxLegendItems: 3,
-                            centerLabel: _timeframe == 'today' ? 'TODAY' : 'WEEK',
-                            formatDuration: widget.formatDuration,
-                          ),
-                      ],
-                    ),
-                  ),
               ],
             );
           },
@@ -1396,19 +1426,12 @@ class _LeaderboardViewState extends State<LeaderboardView> {
         ? 'Enter your MongoDB Atlas connection string in Settings to sync family data.'
         : 'Could not reach your Atlas cluster. See the error below.';
 
+    final theme = Theme.of(context);
+    final isDark = theme.brightness == Brightness.dark;
+
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        const Text(
-          'Leaderboard',
-          style: TextStyle(
-            fontSize: 26,
-            color: Color(0xFF18181B),
-            fontWeight: FontWeight.bold,
-            letterSpacing: -0.5,
-          ),
-        ),
-        const SizedBox(height: 24),
         Card(
           child: Padding(
             padding: const EdgeInsets.all(24.0),
@@ -1417,24 +1440,24 @@ class _LeaderboardViewState extends State<LeaderboardView> {
               children: [
                 Icon(
                   noUri ? Icons.cloud_off_outlined : Icons.warning_amber_rounded,
-                  color: noUri ? const Color(0xFF71717A) : const Color(0xFFDC2626),
+                  color: noUri ? theme.colorScheme.onSurfaceVariant : const Color(0xFFDC2626),
                   size: 32,
                 ),
                 const SizedBox(height: 16),
                 Text(
                   headline,
-                  style: const TextStyle(
+                  style: TextStyle(
                     fontSize: 17,
                     fontWeight: FontWeight.bold,
-                    color: Color(0xFF18181B),
+                    color: theme.colorScheme.onSurface,
                   ),
                 ),
                 const SizedBox(height: 8),
                 Text(
                   subtitle,
-                  style: const TextStyle(
+                  style: TextStyle(
                     fontSize: 14,
-                    color: Color(0xFF71717A),
+                    color: theme.colorScheme.onSurfaceVariant,
                     height: 1.5,
                   ),
                 ),
@@ -1481,14 +1504,14 @@ class _LeaderboardViewState extends State<LeaderboardView> {
                     width: double.infinity,
                     padding: const EdgeInsets.symmetric(vertical: 14),
                     decoration: BoxDecoration(
-                      color: const Color(0xFF18181B),
+                      color: theme.colorScheme.primary,
                       borderRadius: BorderRadius.circular(10),
                     ),
-                    child: const Center(
+                    child: Center(
                       child: Text(
                         'Open Settings',
                         style: TextStyle(
-                          color: Colors.white,
+                          color: isDark ? Colors.black : Colors.white,
                           fontWeight: FontWeight.bold,
                           fontSize: 14,
                         ),
@@ -1505,17 +1528,18 @@ class _LeaderboardViewState extends State<LeaderboardView> {
   }
 
   Widget _buildEmptyAtlasState() {
+    final theme = Theme.of(context);
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         Row(
           mainAxisAlignment: MainAxisAlignment.spaceBetween,
           children: [
-            const Text(
+            Text(
               'Leaderboard',
               style: TextStyle(
                 fontSize: 26,
-                color: Color(0xFF18181B),
+                color: theme.colorScheme.onSurface,
                 fontWeight: FontWeight.bold,
                 letterSpacing: -0.5,
               ),
@@ -1544,23 +1568,23 @@ class _LeaderboardViewState extends State<LeaderboardView> {
             padding: const EdgeInsets.all(24.0),
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
-              children: const [
-                Icon(Icons.hourglass_empty_rounded, color: Color(0xFF71717A), size: 32),
-                SizedBox(height: 16),
+              children: [
+                Icon(Icons.hourglass_empty_rounded, color: theme.colorScheme.onSurfaceVariant, size: 32),
+                const SizedBox(height: 16),
                 Text(
                   'No data synced yet',
                   style: TextStyle(
                     fontSize: 17,
                     fontWeight: FontWeight.bold,
-                    color: Color(0xFF18181B),
+                    color: theme.colorScheme.onSurface,
                   ),
                 ),
-                SizedBox(height: 8),
+                const SizedBox(height: 8),
                 Text(
                   'Connected to Atlas successfully. Waiting for data.\n\nThe background sync runs once a day. Trigger a manual sync from Settings, or wait for the first automatic nightly sync.',
                   style: TextStyle(
                     fontSize: 14,
-                    color: Color(0xFF71717A),
+                    color: theme.colorScheme.onSurfaceVariant,
                     height: 1.5,
                   ),
                 ),
@@ -1572,31 +1596,6 @@ class _LeaderboardViewState extends State<LeaderboardView> {
     );
   }
 
-  Widget _buildSegmentTab(String title, String tab) {
-    final bool isActive = _timeframe == tab;
-    return GestureDetector(
-      onTap: () => setState(() => _timeframe = tab),
-      child: Container(
-        padding: const EdgeInsets.only(bottom: 8),
-        decoration: BoxDecoration(
-          border: Border(
-            bottom: BorderSide(
-              color: isActive ? const Color(0xFF18181B) : Colors.transparent,
-              width: 2,
-            ),
-          ),
-        ),
-        child: Text(
-          title,
-          style: TextStyle(
-            fontSize: 14,
-            fontWeight: FontWeight.bold,
-            color: isActive ? const Color(0xFF18181B) : const Color(0xFF71717A),
-          ),
-        ),
-      ),
-    );
-  }
 }
 
 // Settings Section
@@ -1656,6 +1655,9 @@ class _SettingsViewState extends State<SettingsView> {
 
   @override
   Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final isDark = theme.brightness == Brightness.dark;
+
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -1663,14 +1665,14 @@ class _SettingsViewState extends State<SettingsView> {
           children: [
             GestureDetector(
               onTap: widget.onClose,
-              child: const Icon(Icons.arrow_back, color: Color(0xFF18181B), size: 22),
+              child: Icon(Icons.arrow_back, color: theme.colorScheme.onSurface, size: 22),
             ),
             const SizedBox(width: 12),
-            const Text(
+            Text(
               'Settings',
               style: TextStyle(
                 fontSize: 22,
-                color: Color(0xFF18181B),
+                color: theme.colorScheme.onSurface,
                 fontWeight: FontWeight.bold,
                 letterSpacing: -0.5,
               ),
@@ -1688,31 +1690,66 @@ class _SettingsViewState extends State<SettingsView> {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                const Text(
+                Text(
                   'Display Name',
-                  style: TextStyle(fontSize: 13, fontWeight: FontWeight.bold, color: Color(0xFF52525B)),
+                  style: TextStyle(fontSize: 13, fontWeight: FontWeight.bold, color: theme.colorScheme.onSurfaceVariant),
                 ),
                 const SizedBox(height: 6),
                 TextField(
                   controller: _nameController,
                   decoration: _buildInputDecoration('Enter your display name'),
-                  style: const TextStyle(fontSize: 14, color: Color(0xFF18181B)),
+                  style: TextStyle(fontSize: 14, color: theme.colorScheme.onSurface),
                 ),
                 const SizedBox(height: 16),
-                const Text(
+                Text(
                   'Member ID',
-                  style: TextStyle(fontSize: 13, fontWeight: FontWeight.bold, color: Color(0xFF52525B)),
+                  style: TextStyle(fontSize: 13, fontWeight: FontWeight.bold, color: theme.colorScheme.onSurfaceVariant),
                 ),
                 const SizedBox(height: 6),
                 TextField(
                   controller: _memberIdController,
                   decoration: _buildInputDecoration('Enter family member ID (e.g. 1)'),
-                  style: const TextStyle(fontSize: 14, color: Color(0xFF18181B)),
+                  style: TextStyle(fontSize: 14, color: theme.colorScheme.onSurface),
                 ),
                 const SizedBox(height: 6),
-                const Text(
+                Text(
                   'Uniquely identifies this device on the leaderboard. Automatically generated from your device ID so stats persist across reinstalls.',
-                  style: TextStyle(fontSize: 11, color: Color(0xFF71717A), height: 1.3),
+                  style: TextStyle(fontSize: 11, color: theme.colorScheme.onSurfaceVariant, height: 1.3),
+                ),
+              ],
+            ),
+          ),
+        ),
+        const SizedBox(height: 28),
+
+        // Section: Appearance (Theme)
+        _buildSectionHeader('APPEARANCE'),
+        const SizedBox(height: 8),
+        Card(
+          child: Padding(
+            padding: const EdgeInsets.all(20),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  'Theme Mode',
+                  style: TextStyle(fontSize: 13, fontWeight: FontWeight.bold, color: theme.colorScheme.onSurfaceVariant),
+                ),
+                const SizedBox(height: 12),
+                ListenableBuilder(
+                  listenable: ThemeViewModel.instance,
+                  builder: (context, _) {
+                    final currentTheme = ThemeViewModel.instance.themeMode;
+                    return Row(
+                      children: [
+                        _buildThemeButton('Light', 'light', currentTheme == 'light'),
+                        const SizedBox(width: 8),
+                        _buildThemeButton('Dark', 'dark', currentTheme == 'dark'),
+                        const SizedBox(width: 8),
+                        _buildThemeButton('AMOLED', 'amoled', currentTheme == 'amoled'),
+                      ],
+                    );
+                  },
                 ),
               ],
             ),
@@ -1729,9 +1766,9 @@ class _SettingsViewState extends State<SettingsView> {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                const Text(
+                Text(
                   'MongoDB Atlas Connection URI',
-                  style: TextStyle(fontSize: 13, fontWeight: FontWeight.bold, color: Color(0xFF52525B)),
+                  style: TextStyle(fontSize: 13, fontWeight: FontWeight.bold, color: theme.colorScheme.onSurfaceVariant),
                 ),
                 const SizedBox(height: 6),
                 TextField(
@@ -1742,22 +1779,22 @@ class _SettingsViewState extends State<SettingsView> {
                       onTap: () => setState(() => _obscureUri = !_obscureUri),
                       child: Icon(
                         _obscureUri ? Icons.visibility_off_outlined : Icons.visibility_outlined,
-                        color: const Color(0xFF71717A),
+                        color: theme.colorScheme.onSurfaceVariant,
                         size: 18,
                       ),
                     ),
                   ),
-                  style: const TextStyle(fontSize: 12, fontFamily: 'monospace', color: Color(0xFF18181B)),
+                  style: TextStyle(fontSize: 12, fontFamily: 'monospace', color: theme.colorScheme.onSurface),
                 ),
                 const SizedBox(height: 12),
                 Row(
-                  children: const [
-                    Icon(Icons.shield_outlined, size: 13, color: Color(0xFF71717A)),
-                    SizedBox(width: 6),
+                  children: [
+                    Icon(Icons.shield_outlined, size: 13, color: theme.colorScheme.onSurfaceVariant),
+                    const SizedBox(width: 6),
                     Expanded(
                       child: Text(
                         'Stored in Android EncryptedSharedPreferences.',
-                        style: TextStyle(fontSize: 10, color: Color(0xFF71717A)),
+                        style: TextStyle(fontSize: 10, color: theme.colorScheme.onSurfaceVariant),
                       ),
                     ),
                   ],
@@ -1804,15 +1841,15 @@ class _SettingsViewState extends State<SettingsView> {
                 Expanded(
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
-                    children: const [
+                    children: [
                       Text(
                         'PACKAGE_USAGE_STATS',
-                        style: TextStyle(fontSize: 13, fontWeight: FontWeight.bold, color: Color(0xFF18181B)),
+                        style: TextStyle(fontSize: 13, fontWeight: FontWeight.bold, color: theme.colorScheme.onSurface),
                       ),
-                      SizedBox(height: 4),
+                      const SizedBox(height: 4),
                       Text(
                         'Required to read screen time via UsageStatsManager.',
-                        style: TextStyle(fontSize: 11, color: Color(0xFF71717A)),
+                        style: TextStyle(fontSize: 11, color: theme.colorScheme.onSurfaceVariant),
                       ),
                     ],
                   ),
@@ -1837,12 +1874,16 @@ class _SettingsViewState extends State<SettingsView> {
                     child: Container(
                       padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
                       decoration: BoxDecoration(
-                        color: const Color(0xFF18181B),
+                        color: theme.colorScheme.primary,
                         borderRadius: BorderRadius.circular(6),
                       ),
-                      child: const Text(
+                      child: Text(
                         'GRANT',
-                        style: TextStyle(fontSize: 9, fontWeight: FontWeight.bold, color: Colors.white),
+                        style: TextStyle(
+                          fontSize: 9,
+                          fontWeight: FontWeight.bold,
+                          color: isDark ? Colors.black : Colors.white,
+                        ),
                       ),
                     ),
                   ),
@@ -1874,13 +1915,17 @@ class _SettingsViewState extends State<SettingsView> {
                 child: Container(
                   height: 46,
                   decoration: BoxDecoration(
-                    color: const Color(0xFF18181B),
+                    color: theme.colorScheme.primary,
                     borderRadius: BorderRadius.circular(12),
                   ),
-                  child: const Center(
+                  child: Center(
                     child: Text(
-                      'Save Changes',
-                      style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 14),
+                      'Save Settings',
+                      style: TextStyle(
+                        fontSize: 14,
+                        fontWeight: FontWeight.bold,
+                        color: isDark ? Colors.black : Colors.white,
+                      ),
                     ),
                   ),
                 ),
@@ -1894,35 +1939,35 @@ class _SettingsViewState extends State<SettingsView> {
                   height: 46,
                   width: 46,
                   decoration: BoxDecoration(
-                    color: Colors.white,
+                    color: theme.colorScheme.surface,
                     borderRadius: BorderRadius.circular(12),
-                    border: Border.all(color: const Color(0xFFE4E4E7), width: 1),
+                    border: Border.all(color: theme.dividerColor, width: 1),
                   ),
                   child: Center(
                     child: widget.isSyncing
-                        ? const SizedBox(
+                        ? SizedBox(
                             width: 16,
                             height: 16,
                             child: CircularProgressIndicator(
                               strokeWidth: 2,
-                              color: Color(0xFF18181B),
+                              color: theme.colorScheme.primary,
                             ),
                           )
-                        : const Icon(Icons.refresh, color: Color(0xFF18181B), size: 20),
+                        : Icon(Icons.refresh, color: theme.colorScheme.onSurface, size: 20),
                   ),
                 ),
               ),
             ]
           ],
         ),
-        const SizedBox(height: 24),
+        const SizedBox(height: 28),
 
-        // ─── Debug Logs ────────────────────────────────────────────────
-        _buildSectionHeader('DEBUG LOGS'),
+        // Section: System Logs
+        _buildSectionHeader('DIAGNOSTIC LOGS'),
         const SizedBox(height: 8),
         Card(
           child: Padding(
-            padding: const EdgeInsets.all(16),
+            padding: const EdgeInsets.all(20),
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
@@ -1930,48 +1975,36 @@ class _SettingsViewState extends State<SettingsView> {
                   mainAxisAlignment: MainAxisAlignment.spaceBetween,
                   children: [
                     Text(
-                      '${widget.logLines.length} entries',
-                      style: const TextStyle(fontSize: 12, color: Color(0xFF71717A)),
+                      'Execution Logs',
+                      style: TextStyle(fontSize: 13, fontWeight: FontWeight.bold, color: theme.colorScheme.onSurface),
                     ),
-                    Row(
-                      children: [
-                        GestureDetector(
-                          onTap: () {
-                            AppLogger.instance.clear();
-                            ScaffoldMessenger.of(context).showSnackBar(
-                              const SnackBar(content: Text('Logs cleared'), duration: Duration(seconds: 1)),
-                            );
-                            setState(() {});
-                          },
-                          child: const Padding(
-                            padding: EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-                            child: Text('Clear', style: TextStyle(fontSize: 12, color: Color(0xFF71717A))),
+                    GestureDetector(
+                      onTap: () {
+                        final logText = widget.logLines.join('\n');
+                        Clipboard.setData(ClipboardData(text: logText));
+                        ScaffoldMessenger.of(context).showSnackBar(
+                          const SnackBar(
+                            content: Text('Logs copied to clipboard!'),
+                            behavior: SnackBarBehavior.floating,
+                            duration: Duration(seconds: 2),
+                          ),
+                        );
+                      },
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                        decoration: BoxDecoration(
+                          color: theme.colorScheme.primary,
+                          borderRadius: BorderRadius.circular(6),
+                        ),
+                        child: Text(
+                          'Copy All',
+                          style: TextStyle(
+                            fontSize: 11,
+                            fontWeight: FontWeight.bold,
+                            color: isDark ? Colors.black : Colors.white,
                           ),
                         ),
-                        GestureDetector(
-                          onTap: () {
-                            Clipboard.setData(ClipboardData(text: AppLogger.instance.dump));
-                            ScaffoldMessenger.of(context).showSnackBar(
-                              const SnackBar(
-                                content: Text('Logs copied to clipboard!'),
-                                behavior: SnackBarBehavior.floating,
-                                duration: Duration(seconds: 2),
-                              ),
-                            );
-                          },
-                          child: Container(
-                            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
-                            decoration: BoxDecoration(
-                              color: const Color(0xFF18181B),
-                              borderRadius: BorderRadius.circular(6),
-                            ),
-                            child: const Text(
-                              'Copy All',
-                              style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: Colors.white),
-                            ),
-                          ),
-                        ),
-                      ],
+                      ),
                     ),
                   ],
                 ),
@@ -1981,15 +2014,14 @@ class _SettingsViewState extends State<SettingsView> {
                   height: 200,
                   padding: const EdgeInsets.all(10),
                   decoration: BoxDecoration(
-                    color: const Color(0xFF0F172A),
+                    color: isDark ? const Color(0xFF0F172A) : const Color(0xFF18181B),
                     borderRadius: BorderRadius.circular(8),
                   ),
                   child: widget.logLines.isEmpty
                       ? const Center(
                           child: Text(
-                            'No logs yet. Save settings or trigger a sync.',
+                            'No logs yet.',
                             style: TextStyle(fontSize: 11, color: Color(0xFF64748B), fontStyle: FontStyle.italic),
-                            textAlign: TextAlign.center,
                           ),
                         )
                       : ListView.builder(
@@ -2027,37 +2059,74 @@ class _SettingsViewState extends State<SettingsView> {
     );
   }
 
+  Widget _buildThemeButton(String label, String value, bool isSelected) {
+    final theme = Theme.of(context);
+    return Expanded(
+      child: GestureDetector(
+        onTap: () => ThemeViewModel.instance.updateTheme(value),
+        child: Container(
+          height: 40,
+          decoration: BoxDecoration(
+            color: isSelected 
+                ? theme.colorScheme.primary 
+                : (theme.brightness == Brightness.dark ? const Color(0xFF27272A) : const Color(0xFFF4F4F5)),
+            borderRadius: BorderRadius.circular(10),
+            border: Border.all(
+              color: isSelected ? Colors.transparent : theme.dividerColor,
+              width: 1,
+            ),
+          ),
+          child: Center(
+            child: Text(
+              label,
+              style: TextStyle(
+                fontSize: 12,
+                fontWeight: FontWeight.bold,
+                color: isSelected 
+                    ? (theme.brightness == Brightness.dark ? Colors.black : Colors.white)
+                    : theme.colorScheme.onSurface,
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
   Widget _buildSectionHeader(String title) {
+    final theme = Theme.of(context);
     return Text(
       title,
-      style: const TextStyle(
+      style: TextStyle(
         fontSize: 10,
         fontWeight: FontWeight.bold,
-        color: Color(0xFF71717A),
+        color: theme.colorScheme.onSurfaceVariant,
         letterSpacing: 1.0,
       ),
     );
   }
 
   InputDecoration _buildInputDecoration(String hint) {
+    final theme = Theme.of(context);
+    final isDark = theme.brightness == Brightness.dark;
     return InputDecoration(
       hintText: hint,
-      hintStyle: const TextStyle(color: Color(0xFFA1A1AA), fontSize: 13),
+      hintStyle: TextStyle(color: theme.colorScheme.onSurfaceVariant.withOpacity(0.5), fontSize: 13),
       filled: true,
-      fillColor: const Color(0xFFF9FAFB),
+      fillColor: isDark ? const Color(0xFF27272A) : const Color(0xFFF9FAFB),
       contentPadding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
       isDense: true,
       border: OutlineInputBorder(
         borderRadius: BorderRadius.circular(10),
-        borderSide: const BorderSide(color: Color(0xFFE4E4E7), width: 1),
+        borderSide: BorderSide(color: theme.dividerColor, width: 1),
       ),
       enabledBorder: OutlineInputBorder(
         borderRadius: BorderRadius.circular(10),
-        borderSide: const BorderSide(color: Color(0xFFE4E4E7), width: 1),
+        borderSide: BorderSide(color: theme.dividerColor, width: 1),
       ),
       focusedBorder: OutlineInputBorder(
         borderRadius: BorderRadius.circular(10),
-        borderSide: const BorderSide(color: Color(0xFF71717A), width: 1),
+        borderSide: BorderSide(color: theme.colorScheme.primary, width: 1),
       ),
     );
   }

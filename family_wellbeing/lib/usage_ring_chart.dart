@@ -54,7 +54,7 @@ class ScreenTimeRingChart extends StatelessWidget {
     return '${h}h ${m}m';
   }
 
-  List<_Segment> _buildSegments() {
+  List<_Segment> _buildSegments(Color otherColor) {
     final sorted = [...breakdown]..sort((a, b) => b.minutes.compareTo(a.minutes));
     final top = sorted.take(maxLegendItems).toList();
     final otherMinutes = sorted.skip(maxLegendItems).fold<int>(0, (sum, a) => sum + a.minutes);
@@ -64,14 +64,20 @@ class ScreenTimeRingChart extends StatelessWidget {
         _Segment(top[i].appName, top[i].minutes, kUsagePalette[i % kUsagePalette.length]),
     ];
     if (otherMinutes > 0) {
-      segments.add(_Segment('Other', otherMinutes, const Color(0xFFD4D4D8)));
+      segments.add(_Segment('Other', otherMinutes, otherColor));
     }
     return segments;
   }
 
   @override
   Widget build(BuildContext context) {
-    final segments = _buildSegments();
+    final theme = Theme.of(context);
+    final isDark = theme.brightness == Brightness.dark;
+
+    final otherColor = isDark ? const Color(0xFF3F3F46) : const Color(0xFFD4D4D8);
+    final trackColor = isDark ? const Color(0xFF27272A) : const Color(0xFFE4E4E7);
+
+    final segments = _buildSegments(otherColor);
     final safeTotal = totalMinutes > 0 ? totalMinutes : 1;
 
     final ring = SizedBox(
@@ -82,7 +88,12 @@ class ScreenTimeRingChart extends StatelessWidget {
         children: [
           CustomPaint(
             size: Size(ringSize, ringSize),
-            painter: _RingPainter(segments: segments, total: safeTotal, strokeWidth: strokeWidth),
+            painter: _RingPainter(
+              segments: segments, 
+              total: safeTotal, 
+              strokeWidth: strokeWidth, 
+              trackColor: trackColor,
+            ),
           ),
           Column(
             mainAxisSize: MainAxisSize.min,
@@ -90,9 +101,9 @@ class ScreenTimeRingChart extends StatelessWidget {
               Text(
                 _fmt(totalMinutes),
                 style: TextStyle(
-                  fontSize: compact ? 18 : 30,
+                  fontSize: compact ? 16 : 28,
                   fontWeight: FontWeight.bold,
-                  color: const Color(0xFF18181B),
+                  color: theme.colorScheme.onSurface,
                   letterSpacing: -0.5,
                 ),
               ),
@@ -102,7 +113,7 @@ class ScreenTimeRingChart extends StatelessWidget {
                 style: TextStyle(
                   fontSize: compact ? 8 : 10,
                   fontWeight: FontWeight.bold,
-                  color: const Color(0xFFA1A1AA),
+                  color: theme.colorScheme.onSurfaceVariant,
                   letterSpacing: 1.2,
                 ),
               ),
@@ -121,7 +132,7 @@ class ScreenTimeRingChart extends StatelessWidget {
             'No app usage recorded.',
             style: TextStyle(
               fontSize: compact ? 12 : 13,
-              color: const Color(0xFF71717A),
+              color: theme.colorScheme.onSurfaceVariant,
               fontStyle: FontStyle.italic,
             ),
           )
@@ -143,7 +154,7 @@ class ScreenTimeRingChart extends StatelessWidget {
                       style: TextStyle(
                         fontSize: compact ? 12 : 13.5,
                         fontWeight: FontWeight.w500,
-                        color: const Color(0xFF18181B),
+                        color: theme.colorScheme.onSurface,
                       ),
                       overflow: TextOverflow.ellipsis,
                     ),
@@ -154,7 +165,7 @@ class ScreenTimeRingChart extends StatelessWidget {
                     style: TextStyle(
                       fontSize: compact ? 11.5 : 13,
                       fontWeight: FontWeight.w600,
-                      color: const Color(0xFF71717A),
+                      color: theme.colorScheme.onSurfaceVariant,
                     ),
                   ),
                 ],
@@ -164,13 +175,26 @@ class ScreenTimeRingChart extends StatelessWidget {
     );
 
     if (compact) {
-      return Row(
-        crossAxisAlignment: CrossAxisAlignment.center,
-        children: [
-          ring,
-          const SizedBox(width: 18),
-          Expanded(child: legend),
-        ],
+      return LayoutBuilder(
+        builder: (context, constraints) {
+          if (constraints.maxWidth < 240) {
+            return Column(
+              children: [
+                ring,
+                const SizedBox(height: 12),
+                legend,
+              ],
+            );
+          }
+          return Row(
+            crossAxisAlignment: CrossAxisAlignment.center,
+            children: [
+              ring,
+              const SizedBox(width: 18),
+              Expanded(child: legend),
+            ],
+          );
+        },
       );
     }
 
@@ -188,8 +212,14 @@ class _RingPainter extends CustomPainter {
   final List<_Segment> segments;
   final int total;
   final double strokeWidth;
+  final Color trackColor;
 
-  _RingPainter({required this.segments, required this.total, required this.strokeWidth});
+  _RingPainter({
+    required this.segments,
+    required this.total,
+    required this.strokeWidth,
+    required this.trackColor,
+  });
 
   @override
   void paint(Canvas canvas, Size size) {
@@ -198,7 +228,7 @@ class _RingPainter extends CustomPainter {
     final rect = Rect.fromCircle(center: center, radius: radius);
 
     final trackPaint = Paint()
-      ..color = const Color(0xFFF0F0F1)
+      ..color = trackColor
       ..style = PaintingStyle.stroke
       ..strokeWidth = strokeWidth
       ..strokeCap = StrokeCap.round;
