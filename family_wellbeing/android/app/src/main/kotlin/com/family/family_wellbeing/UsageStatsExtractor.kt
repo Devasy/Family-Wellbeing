@@ -22,9 +22,10 @@ class UsageStatsExtractor(private val context: Context) {
     private val usageStatsManager = context.getSystemService(Context.USAGE_STATS_SERVICE) as UsageStatsManager
     private val packageManager = context.packageManager
 
-    // Never count these towards a person's screen time.
+    // Never count these system components towards screen time.
+    // The app itself is intentionally NOT excluded so users can see
+    // how long they spend inside Family Wellbeing.
     private val excludedPackages = setOf(
-        context.packageName, // this app itself
         "android",
         "com.android.systemui"
     )

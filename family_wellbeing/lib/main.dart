@@ -592,7 +592,7 @@ class _MainLayoutState extends State<MainLayout> with WidgetsBindingObserver {
   Widget _buildHeader() {
     final theme = Theme.of(context);
     final isDark = theme.brightness == Brightness.dark;
-    
+
     return Container(
       decoration: BoxDecoration(
         color: theme.cardColor,
@@ -633,6 +633,7 @@ class _MainLayoutState extends State<MainLayout> with WidgetsBindingObserver {
                   ),
                 ],
               ),
+              // Profile avatar — tapping opens the settings panel
               GestureDetector(
                 onTap: () {
                   setState(() {
@@ -644,18 +645,34 @@ class _MainLayoutState extends State<MainLayout> with WidgetsBindingObserver {
                   height: 38,
                   decoration: BoxDecoration(
                     shape: BoxShape.circle,
-                    color: _activeTab == 'settings' ? theme.colorScheme.primary : theme.cardColor,
+                    color: _activeTab == 'settings'
+                        ? theme.colorScheme.primary
+                        : const Color(0xFFD85A30),
                     border: Border.all(
-                      color: _activeTab == 'settings' ? theme.colorScheme.primary : theme.dividerColor,
+                      color: _activeTab == 'settings'
+                          ? theme.colorScheme.primary
+                          : const Color(0xFFD85A30),
+                      width: 2,
                     ),
                   ),
-                  child: Icon(
-                    _activeTab == 'settings' ? Icons.keyboard_arrow_down : Icons.person_outline,
-                    color: _activeTab == 'settings' 
-                        ? (isDark ? Colors.black : Colors.white) 
-                        : theme.colorScheme.onSurfaceVariant,
-                    size: 20,
-                  ),
+                  child: _activeTab == 'settings'
+                      ? Icon(
+                          Icons.keyboard_arrow_down,
+                          color: isDark ? Colors.black : Colors.white,
+                          size: 20,
+                        )
+                      : Center(
+                          child: Text(
+                            _displayName.isNotEmpty
+                                ? _displayName[0].toUpperCase()
+                                : 'U',
+                            style: const TextStyle(
+                              color: Colors.white,
+                              fontWeight: FontWeight.bold,
+                              fontSize: 15,
+                            ),
+                          ),
+                        ),
                 ),
               ),
             ],
@@ -711,70 +728,26 @@ class _MainLayoutState extends State<MainLayout> with WidgetsBindingObserver {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        Row(
-          mainAxisAlignment: MainAxisAlignment.spaceBetween,
-          children: [
-            Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(
-                  'Overview',
-                  style: TextStyle(
-                    fontSize: 26,
-                    color: theme.colorScheme.onSurface,
-                    fontWeight: FontWeight.bold,
-                    letterSpacing: -0.5,
-                  ),
-                ),
-                const SizedBox(height: 4),
-                Text(
-                  'Your real screen time today.',
-                  style: TextStyle(
-                    fontSize: 14,
-                    color: theme.colorScheme.onSurfaceVariant,
-                  ),
-                ),
-              ],
-            ),
-            GestureDetector(
-              onTap: () {
-                final selfMember = Member(
-                  id: _memberId,
-                  name: _displayName,
-                  deviceModel: _deviceModel.isNotEmpty ? _deviceModel : 'This Device',
-                  avatarColor: const Color(0xFFD85A30),
-                );
-                Navigator.of(context).push(
-                  MaterialPageRoute(
-                    builder: (context) => MemberDetailView(
-                      member: selfMember,
-                      db: _dbRecords,
-                      formatDuration: _formatDuration,
-                      initialTimeframe: 'today',
-                    ),
-                  ),
-                );
-              },
-              child: Hero(
-                tag: 'avatar_$_memberId',
-                child: CircleAvatar(
-                  radius: 22,
-                  backgroundColor: const Color(0xFFD85A30),
-                  child: Text(
-                    _displayName.isNotEmpty ? _displayName[0].toUpperCase() : 'U',
-                    style: const TextStyle(
-                      color: Colors.white,
-                      fontWeight: FontWeight.bold,
-                      fontSize: 14,
-                    ),
-                  ),
-                ),
-              ),
-            ),
-          ],
+        // Header — title only, no avatar (profile moved to top-right)
+        Text(
+          'Overview',
+          style: TextStyle(
+            fontSize: 26,
+            color: theme.colorScheme.onSurface,
+            fontWeight: FontWeight.bold,
+            letterSpacing: -0.5,
+          ),
+        ),
+        const SizedBox(height: 4),
+        Text(
+          'Your real screen time today.',
+          style: TextStyle(
+            fontSize: 14,
+            color: theme.colorScheme.onSurfaceVariant,
+          ),
         ),
         const SizedBox(height: 24),
-        
+
         Text(
           'App Breakdown',
           style: TextStyle(
@@ -784,36 +757,57 @@ class _MainLayoutState extends State<MainLayout> with WidgetsBindingObserver {
           ),
         ),
         const SizedBox(height: 12),
-        Card(
-          child: Padding(
-            padding: const EdgeInsets.symmetric(vertical: 32, horizontal: 20),
-            child: _localTodayBreakdown.isEmpty
-                ? Column(
-                    children: [
-                      Text(
-                        _formatDuration(_localTodayTotalMinutes),
-                        style: TextStyle(
-                          fontSize: 44,
-                          fontWeight: FontWeight.bold,
-                          color: theme.colorScheme.onSurface,
-                          letterSpacing: -1.0,
+        // Tapping the ring chart card opens the self detail view
+        GestureDetector(
+          onTap: () {
+            final selfMember = Member(
+              id: _memberId,
+              name: _displayName,
+              deviceModel: _deviceModel.isNotEmpty ? _deviceModel : 'This Device',
+              avatarColor: const Color(0xFFD85A30),
+            );
+            Navigator.of(context).push(
+              MaterialPageRoute(
+                builder: (context) => MemberDetailView(
+                  member: selfMember,
+                  db: _dbRecords,
+                  formatDuration: _formatDuration,
+                  initialTimeframe: 'today',
+                ),
+              ),
+            );
+          },
+          child: Card(
+            child: Padding(
+              padding: const EdgeInsets.symmetric(vertical: 32, horizontal: 20),
+              child: _localTodayBreakdown.isEmpty
+                  ? Column(
+                      children: [
+                        Text(
+                          _formatDuration(_localTodayTotalMinutes),
+                          style: TextStyle(
+                            fontSize: 44,
+                            fontWeight: FontWeight.bold,
+                            color: theme.colorScheme.onSurface,
+                            letterSpacing: -1.0,
+                          ),
                         ),
-                      ),
-                      const SizedBox(height: 12),
-                      Text(
-                        'No app usage detected yet today. Try using some apps!',
-                        style: TextStyle(color: theme.colorScheme.onSurfaceVariant, fontSize: 13),
-                        textAlign: TextAlign.center,
-                      ),
-                    ],
-                  )
-                : ScreenTimeRingChart(
-                    totalMinutes: _localTodayTotalMinutes,
-                    breakdown: _localTodayBreakdown,
-                    centerLabel: 'TODAY',
-                    maxLegendItems: 6,
-                    formatDuration: _formatDuration,
-                  ),
+                        const SizedBox(height: 12),
+                        Text(
+                          'No app usage detected yet today. Try using some apps!',
+                          style: TextStyle(color: theme.colorScheme.onSurfaceVariant, fontSize: 13),
+                          textAlign: TextAlign.center,
+                        ),
+                      ],
+                    )
+                  : ScreenTimeRingChart(
+                      totalMinutes: _localTodayTotalMinutes,
+                      breakdown: _localTodayBreakdown,
+                      centerLabel: 'TODAY',
+                      maxLegendItems: 6,
+                      formatDuration: _formatDuration,
+                    ),
+            ),
           ),
         ),
       ],
@@ -1123,6 +1117,7 @@ class _LeaderboardViewState extends State<LeaderboardView> {
 
     final theme = Theme.of(context);
     return Column(
+      mainAxisSize: MainAxisSize.min,
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         Column(
@@ -1247,9 +1242,10 @@ class _LeaderboardViewState extends State<LeaderboardView> {
                         ),
                         const SizedBox(width: 6),
 
-                        // Hero Avatar
+                        // Hero Avatar — prefixed with 'lb_' to avoid tag collision
+                        // with the dashboard avatar (would cause blank screen on release).
                         Hero(
-                          tag: 'avatar_${member.id}',
+                          tag: 'lb_avatar_${member.id}',
                           child: Container(
                             width: 34,
                             height: 34,
@@ -1282,7 +1278,7 @@ class _LeaderboardViewState extends State<LeaderboardView> {
                                   Row(
                                     children: [
                                       Hero(
-                                        tag: 'name_${member.id}',
+                                        tag: 'lb_name_${member.id}',
                                         child: Material(
                                           color: Colors.transparent,
                                           child: Text(

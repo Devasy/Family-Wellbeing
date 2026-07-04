@@ -279,7 +279,7 @@ class _MemberDetailViewState extends State<MemberDetailView> {
                 child: Column(
                   children: [
                     Hero(
-                      tag: 'avatar_${widget.member.id}',
+                      tag: 'lb_avatar_${widget.member.id}',
                       child: CircleAvatar(
                         radius: 44,
                         backgroundColor: widget.member.avatarColor,
@@ -295,7 +295,7 @@ class _MemberDetailViewState extends State<MemberDetailView> {
                     ),
                     const SizedBox(height: 16),
                     Hero(
-                      tag: 'name_${widget.member.id}',
+                      tag: 'lb_name_${widget.member.id}',
                       child: Material(
                         color: Colors.transparent,
                         child: Text(
