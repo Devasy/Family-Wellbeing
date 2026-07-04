@@ -74,6 +74,15 @@ class UsageStatsExtractor(private val context: Context) {
 
         while (events.hasNextEvent()) {
             events.getNextEvent(event)
+
+            // Screen-off/lock events may have a null packageName on many OEMs.
+            // Handle them before the package null-check so all open sessions are
+            // properly closed when the screen turns off.
+            if (event.eventType == UsageEvents.Event.SCREEN_NON_INTERACTIVE) {
+                foregroundSince.keys.toList().forEach { closeSession(it, event.timeStamp) }
+                continue
+            }
+
             val pkg = event.packageName ?: continue
 
             when (event.eventType) {
@@ -86,11 +95,6 @@ class UsageStatsExtractor(private val context: Context) {
                 UsageEvents.Event.ACTIVITY_PAUSED,
                 UsageEvents.Event.MOVE_TO_BACKGROUND -> {
                     closeSession(pkg, event.timeStamp)
-                }
-                UsageEvents.Event.SCREEN_NON_INTERACTIVE -> {
-                    // Screen locked/off - some OEMs don't fire a pause event
-                    // on lock, so force-close anything still "open".
-                    foregroundSince.keys.toList().forEach { closeSession(it, event.timeStamp) }
                 }
             }
         }

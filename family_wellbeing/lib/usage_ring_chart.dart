@@ -1,6 +1,6 @@
 import 'dart:math';
 import 'package:flutter/material.dart';
-import 'main.dart' show AppUsage;
+import 'models.dart' show AppUsage;
 
 /// Color palette for chart segments - kept warm/neutral, no purple,
 /// consistent with the rest of the app's accent (clay/slate/teal family).
@@ -257,6 +257,19 @@ class _RingPainter extends CustomPainter {
 
   @override
   bool shouldRepaint(covariant _RingPainter oldDelegate) {
-    return oldDelegate.total != total || oldDelegate.segments != segments;
+    if (oldDelegate.total != total ||
+        oldDelegate.trackColor != trackColor ||
+        oldDelegate.strokeWidth != strokeWidth ||
+        oldDelegate.segments.length != segments.length) {
+      return true;
+    }
+    for (int i = 0; i < segments.length; i++) {
+      final a = oldDelegate.segments[i];
+      final b = segments[i];
+      if (a.name != b.name || a.minutes != b.minutes || a.color != b.color) {
+        return true;
+      }
+    }
+    return false;
   }
 }

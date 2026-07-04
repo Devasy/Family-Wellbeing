@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:workmanager/workmanager.dart';
+import 'models.dart';
 import 'mongo_service.dart';
 import 'usage_ring_chart.dart';
 import 'theme_manager.dart';
@@ -109,6 +110,7 @@ Future<bool> runSync() async {
   final today = DateTime.now();
   
   // Sync last 14 days
+  bool syncFailed = false;
   for (int i = 1; i <= 14; i++) {
     final pastDay = today.subtract(Duration(days: i));
     final pastDayStr = '${pastDay.year}-${pastDay.month.toString().padLeft(2, '0')}-${pastDay.day.toString().padLeft(2, '0')}';
@@ -143,6 +145,7 @@ Future<bool> runSync() async {
       }
     } catch (e) {
       _log.log('runSync: error syncing past day $pastDayStr: $e');
+      syncFailed = true;
     }
   }
 
@@ -176,8 +179,13 @@ Future<bool> runSync() async {
     }
   } catch (e) {
     _log.log('runSync: error syncing today: $e');
+    syncFailed = true;
   }
 
+  if (syncFailed) {
+    _log.log('runSync: completed with errors (partial sync)');
+    return false;
+  }
   _log.log('runSync: sync completed successfully');
   return true;
 }
@@ -223,40 +231,6 @@ class Member {
     required this.name,
     required this.deviceModel,
     required this.avatarColor,
-  });
-}
-
-class AppUsage {
-  final String appName;
-  final String packageName;
-  final int minutes;
-
-  AppUsage({
-    required this.appName,
-    required this.packageName,
-    required this.minutes,
-  });
-}
-
-class UsageRecord {
-  final String id;
-  final String memberId;
-  final String memberName;
-  final String deviceModel;
-  final String date;
-  final int totalScreenTimeMinutes;
-  final List<AppUsage> appBreakdown;
-  final bool isComplete;
-
-  UsageRecord({
-    required this.id,
-    required this.memberId,
-    this.memberName = '',
-    this.deviceModel = '',
-    required this.date,
-    required this.totalScreenTimeMinutes,
-    required this.appBreakdown,
-    required this.isComplete,
   });
 }
 
@@ -1793,7 +1767,7 @@ class _SettingsViewState extends State<SettingsView> {
                     const SizedBox(width: 6),
                     Expanded(
                       child: Text(
-                        'Stored in Android EncryptedSharedPreferences.',
+                        'Stored locally in app preferences on this device.',
                         style: TextStyle(fontSize: 10, color: theme.colorScheme.onSurfaceVariant),
                       ),
                     ),

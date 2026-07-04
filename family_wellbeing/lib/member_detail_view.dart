@@ -3,7 +3,8 @@ import 'package:flutter/material.dart';
 import 'usage_ring_chart.dart';
 import 'screen_time_bar_chart.dart';
 import 'sliding_segment_control.dart';
-import 'main.dart'; // To access Member, AppUsage and UsageRecord classes
+import 'models.dart'; // AppUsage, UsageRecord
+import 'main.dart' show Member; // Member lives in main.dart
 
 class MemberDetailView extends StatefulWidget {
   const MemberDetailView({

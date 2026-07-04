@@ -1,5 +1,5 @@
 import 'package:mongo_dart/mongo_dart.dart';
-import 'main.dart'; // To reference UsageRecord and AppUsage
+import 'models.dart'; // AppUsage, UsageRecord
 
 class MongoDbService {
   MongoDbService._();
@@ -25,7 +25,6 @@ class MongoDbService {
     final uri = _getFormattedUri(rawUri);
     final steps = <String>[];
     steps.add("[1] URI type: ${uri.startsWith('mongodb+srv://') ? 'mongodb+srv://' : 'standard mongodb://'}");
-    steps.add("[2] Target database: wellbeing");
     steps.add("[3] Initializing mongo_dart client...");
 
     Db? db;
@@ -33,12 +32,14 @@ class MongoDbService {
       db = await Db.create(uri);
       steps.add("[4] Awaiting connection open (TLS enabled natively)...");
       await db.open();
-      
+
+      final dbName = db.databaseName ?? 'wellbeing';
+      steps.add("[2] Target database: $dbName");
       steps.add("[5] Connection successfully established!");
-      
+
       final collection = db.collection('daily_usage');
       final count = await collection.count();
-      steps.add("[6] Collection 'wellbeing.daily_usage': $count document(s) found.");
+      steps.add("[6] Collection '$dbName.daily_usage': $count document(s) found.");
       
       return "OK|${steps.join('\n')}";
     } catch (e) {
