@@ -7,7 +7,11 @@
 .buildlog/
 .history
 
-
+# Secrets
+.env
+venv
+.venv
+base/
 
 # Flutter repo-specific
 /bin/cache/
