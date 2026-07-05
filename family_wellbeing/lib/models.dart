@@ -1,5 +1,4 @@
-﻿/// Shared data models used across the app, mongo_service, and chart widgets.
-library;
+import 'package:flutter/material.dart';
 
 class AppUsage {
   final String appName;
@@ -34,3 +33,18 @@ class UsageRecord {
     required this.isComplete,
   });
 }
+
+class Member {
+  final String id;
+  String name;
+  String deviceModel;
+  final Color avatarColor;
+
+  Member({
+    required this.id,
+    required this.name,
+    required this.deviceModel,
+    required this.avatarColor,
+  });
+}
+

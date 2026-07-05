@@ -219,20 +219,6 @@ class FamilyWellbeingApp extends StatelessWidget {
   }
 }
 
-// Data models
-class Member {
-  final String id;
-  String name;
-  String deviceModel;
-  final Color avatarColor;
-
-  Member({
-    required this.id,
-    required this.name,
-    required this.deviceModel,
-    required this.avatarColor,
-  });
-}
 
 class MainLayout extends StatefulWidget {
   const MainLayout({super.key});
