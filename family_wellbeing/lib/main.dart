@@ -259,11 +259,16 @@ class _MainLayoutState extends State<MainLayout> with WidgetsBindingObserver {
   List<UsageRecord> _dbRecords = [];
   Map<String, Map<String, String>> _userProfiles = {};
   bool _isSyncing = false;
+  bool _isFetching = false;          // reentrancy guard for _checkStatusAndFetchData
   bool _showSyncIndicator = false;
   DateTime? _lastSynced;
   bool _hasPermission = false;
   bool _mongoConnected = false;  // true only when real records fetched from Atlas
   String? _dbError;              // detailed diagnostic error shown in UI
+
+  // Memoized members list to avoid leaderboard recalculation on every rebuild
+  List<Member>? _cachedMembers;
+  String? _cachedMembersKey;
 
   // Platform channel
   static const _platform = MethodChannel('com.family.wellbeing/stats');
@@ -387,6 +392,13 @@ class _MainLayoutState extends State<MainLayout> with WidgetsBindingObserver {
   }
 
   Future<void> _checkStatusAndFetchData() async {
+    // Reentrancy guard: skip if a fetch is already in flight.
+    if (_isFetching) {
+      _log.log('checkStatus: skipped (fetch already in flight)');
+      return;
+    }
+    _isFetching = true;
+    try {
     _log.log('checkStatus: starting (mongoUri=${_mongoUri.isNotEmpty ? "set" : "empty"})');
     setState(() {
       _isSyncing = true;
@@ -477,6 +489,9 @@ class _MainLayoutState extends State<MainLayout> with WidgetsBindingObserver {
         setState(() => _showSyncIndicator = false);
       }
     });
+    } finally {
+      _isFetching = false;
+    }
   }
 
   Future<void> _requestUsagePermission() async {
@@ -501,6 +516,13 @@ class _MainLayoutState extends State<MainLayout> with WidgetsBindingObserver {
 
 
   List<Member> _getMembersList(List<UsageRecord> db) {
+    // Build a cache key from the inputs that affect the member list.
+    final String cacheKey =
+        '${_displayName}|${_memberId}|${_userProfiles.length}|${db.length}';
+    if (_cachedMembers != null && _cachedMembersKey == cacheKey) {
+      return _cachedMembers!;
+    }
+
     final uniqueIds = db.map((r) => r.memberId).toSet();
     uniqueIds.add(_memberId);
 
@@ -546,6 +568,9 @@ class _MainLayoutState extends State<MainLayout> with WidgetsBindingObserver {
         ));
       }
     }
+
+    _cachedMembers = dynamicMembers;
+    _cachedMembersKey = cacheKey;
     return dynamicMembers;
   }
 

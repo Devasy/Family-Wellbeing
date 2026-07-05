@@ -111,17 +111,25 @@ class GlassBottomNav extends StatelessWidget {
   }) {
     final bool isActive = activeTab == tab;
     final theme = Theme.of(context);
+    // Capitalise first letter for the semantic label, e.g. "dashboard" → "Dashboard"
+    final String semanticLabel =
+        '${tab[0].toUpperCase()}${tab.substring(1)} tab';
 
     return Expanded(
-      child: GestureDetector(
-        onTap: () => onTabChanged(tab),
-        child: Container(
-          color: Colors.transparent, // Expand gesture hit box
-          alignment: Alignment.center,
-          child: Icon(
-            isActive ? activeIcon : inactiveIcon,
-            color: isActive ? theme.colorScheme.onSurface : theme.colorScheme.onSurfaceVariant,
-            size: 26, // 1.2x of 22
+      child: Semantics(
+        label: semanticLabel,
+        button: true,
+        selected: isActive,
+        child: GestureDetector(
+          onTap: () => onTabChanged(tab),
+          child: Container(
+            color: Colors.transparent, // Expand gesture hit box
+            alignment: Alignment.center,
+            child: Icon(
+              isActive ? activeIcon : inactiveIcon,
+              color: isActive ? theme.colorScheme.onSurface : theme.colorScheme.onSurfaceVariant,
+              size: 26, // 1.2x of 22
+            ),
           ),
         ),
       ),

@@ -180,6 +180,8 @@ class _MemberDetailViewState extends State<MemberDetailView> {
         }
       }
 
+      _activeApps = weeklyBreakdown;
+
       _barChartData = [];
       for (final day in _weekDays) {
         final dayStr = _yyyymmdd(day);
@@ -284,7 +286,9 @@ class _MemberDetailViewState extends State<MemberDetailView> {
                         radius: 44,
                         backgroundColor: widget.member.avatarColor,
                         child: Text(
-                          widget.member.name.substring(0, 1).toUpperCase(),
+                           widget.member.name.isNotEmpty
+                               ? widget.member.name.substring(0, 1).toUpperCase()
+                               : 'U',
                           style: const TextStyle(
                             fontSize: 32,
                             fontWeight: FontWeight.bold,

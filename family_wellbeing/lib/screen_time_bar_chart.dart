@@ -2,6 +2,32 @@ import 'dart:math';
 import 'package:flutter/material.dart';
 import 'usage_ring_chart.dart' show kUsagePalette;
 
+/// Shared bar layout so _handleTouch and _BarChartPainter.paint always agree.
+class _BarLayout {
+  const _BarLayout._({
+    required this.barWidth,
+    required this.spacing,
+    required this.startX,
+  });
+
+  final double barWidth;
+  final double spacing;
+  final double startX;
+
+  static const double leftPadding = 36.0;
+  static const double rightPadding = 12.0;
+
+  /// Returns null when [chartWidth] ≤ 0 or [dayCount] == 0.
+  static _BarLayout? compute(double chartWidth, int dayCount) {
+    if (chartWidth <= 0 || dayCount == 0) return null;
+    final double barWidth = min(20.0, chartWidth / (dayCount * 1.6));
+    final double spacing =
+        (chartWidth - (barWidth * dayCount)) / (dayCount - 1 + 2);
+    final double startX = leftPadding + spacing;
+    return _BarLayout._(barWidth: barWidth, spacing: spacing, startX: startX);
+  }
+}
+
 class BarChartSegment {
   final String name;
   final int minutes;
@@ -48,21 +74,17 @@ class _ScreenTimeBarChartState extends State<ScreenTimeBarChart> {
   int? _hoveredIdx;
 
   void _handleTouch(Offset localPos, Size size) {
-    const double leftPadding = 36.0;
-    const double rightPadding = 12.0;
-    final double chartWidth = size.width - leftPadding - rightPadding;
-
-    if (chartWidth <= 0) return;
+    final double chartWidth =
+        size.width - _BarLayout.leftPadding - _BarLayout.rightPadding;
+    final layout = _BarLayout.compute(chartWidth, widget.dayData.length);
+    if (layout == null) return;
 
     final int numDays = widget.dayData.length;
-    final double barWidth = min(20.0, chartWidth / (numDays * 1.6));
-    final double spacing = (chartWidth - (barWidth * numDays)) / (numDays - 1 + 2);
-    final double startX = leftPadding + spacing;
-
     int? detectedIdx;
     for (int i = 0; i < numDays; i++) {
-      final double x = startX + i * (barWidth + spacing);
-      if (localPos.dx >= x - spacing / 2 && localPos.dx <= x + barWidth + spacing / 2) {
+      final double x = layout.startX + i * (layout.barWidth + layout.spacing);
+      if (localPos.dx >= x - layout.spacing / 2 &&
+          localPos.dx <= x + layout.barWidth + layout.spacing / 2) {
         detectedIdx = i;
         break;
       }
@@ -97,6 +119,8 @@ class _ScreenTimeBarChartState extends State<ScreenTimeBarChart> {
               onPanUpdate: (details) => _handleTouch(details.localPosition, chartSize),
               onTapUp: (_) => setState(() => _hoveredIdx = null),
               onTapCancel: () => setState(() => _hoveredIdx = null),
+              onPanEnd: (_) => setState(() => _hoveredIdx = null),
+              onPanCancel: () => setState(() => _hoveredIdx = null),
               child: SizedBox(
                 height: widget.height,
                 width: double.infinity,
@@ -228,9 +252,11 @@ class _BarChartPainter extends CustomPainter {
     }
 
     // Draw bars
-    final double barWidth = min(20.0, chartWidth / (dayData.length * 1.6));
-    final double spacing = (chartWidth - (barWidth * dayData.length)) / (dayData.length - 1 + 2);
-    final double startX = leftPadding + spacing;
+    final layout = _BarLayout.compute(chartWidth, dayData.length);
+    if (layout == null) return; // nothing to draw (empty data)
+    final double barWidth = layout.barWidth;
+    final double spacing = layout.spacing;
+    final double startX = layout.startX;
 
     for (int i = 0; i < dayData.length; i++) {
       final day = dayData[i];
@@ -411,7 +437,19 @@ class _BarChartPainter extends CustomPainter {
 
   @override
   bool shouldRepaint(covariant _BarChartPainter oldDelegate) {
-    return oldDelegate.dayData != dayData ||
+    // Value-based comparison for dayData to avoid spurious repaints when the
+    // parent rebuilds with a new list instance containing identical entries.
+    bool dayDataChanged = oldDelegate.dayData.length != dayData.length;
+    if (!dayDataChanged) {
+      for (int i = 0; i < dayData.length; i++) {
+        if (oldDelegate.dayData[i].label != dayData[i].label ||
+            oldDelegate.dayData[i].totalMinutes != dayData[i].totalMinutes) {
+          dayDataChanged = true;
+          break;
+        }
+      }
+    }
+    return dayDataChanged ||
         oldDelegate.avgMinutes != avgMinutes ||
         oldDelegate.yMax != yMax ||
         oldDelegate.theme != theme ||

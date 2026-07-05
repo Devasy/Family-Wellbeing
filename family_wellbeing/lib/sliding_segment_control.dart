@@ -66,19 +66,24 @@ class SlidingSegmentControl extends StatelessWidget {
                   final bool isActive = selectedValue == val;
 
                   return Expanded(
-                    child: GestureDetector(
-                      onTap: () => onValueChanged(val),
-                      child: Container(
-                        color: Colors.transparent, // Expand tap hit area
-                        alignment: Alignment.center,
-                        child: Text(
-                          label,
-                          style: TextStyle(
-                            fontSize: 12.5,
-                            fontWeight: isActive ? FontWeight.bold : FontWeight.w500,
-                            color: isActive
-                                ? theme.colorScheme.onSurface
-                                : theme.colorScheme.onSurfaceVariant,
+                    child: Semantics(
+                      label: label,
+                      button: true,
+                      selected: isActive,
+                      child: GestureDetector(
+                        onTap: () => onValueChanged(val),
+                        child: Container(
+                          color: Colors.transparent, // Expand tap hit area
+                          alignment: Alignment.center,
+                          child: Text(
+                            label,
+                            style: TextStyle(
+                              fontSize: 12.5,
+                              fontWeight: isActive ? FontWeight.bold : FontWeight.w500,
+                              color: isActive
+                                  ? theme.colorScheme.onSurface
+                                  : theme.colorScheme.onSurfaceVariant,
+                            ),
                           ),
                         ),
                       ),
